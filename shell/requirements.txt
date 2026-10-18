@@ -1,0 +1,8 @@
+PyQt6>=6.4
+pyqtgraph
+numpy
+scipy
+pandas
+scikit-learn
+certifi
+pyinstaller
