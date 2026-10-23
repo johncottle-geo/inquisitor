@@ -19830,6 +19830,10 @@ class QuantPanel(W.QWidget):
     @safe
     def open_trace_qa(self):
         self.collect_trace()
+        ws = getattr(self.win, "calib_ws", None)
+        if ws is not None:
+            ws.show_page(ws.tqa)
+            return
         d = getattr(self, "tqa", None)
         if d is None or not d.isVisible():
             d = self.tqa = TraceQADialog(self.win)
@@ -20316,6 +20320,10 @@ class QuantPanel(W.QWidget):
     @safe
     def open_qa(self):
         self.collect_upb()
+        ws = getattr(self.win, "calib_ws", None)
+        if ws is not None:
+            ws.show_page(ws.uqa)
+            return
         if self.qa is None or not self.qa.isVisible():
             self.qa = QADialog(self.win)
         self.qa.refresh()
@@ -23252,14 +23260,14 @@ class InterfPanel(W.QWidget):
 
     def apply_layout(self):
         win = self.win
-        cp = getattr(win, "calib_page", None)
-        on = win.tab_name() == "Calibrate" and cp is not None and cp.f_int.head.isChecked()
+        ws = getattr(win, "calib_ws", None)
+        on = win.tab_name() == "Calibrate" and ws is not None
         if on:
             self._rm_later()
-            if win.plot_host.indexOf(self.plot_box) < 0:
-                win.plot_host.addWidget(self.plot_box)
+            if win.plot_host.indexOf(ws) < 0:
+                win.plot_host.addWidget(ws)
             win.plot_host.setVisible(True)
-            win.plot_host.setCurrentWidget(self.plot_box)
+            win.plot_host.setCurrentWidget(ws)
             tot = sum(win.vsplit.sizes())
             if tot > 50:
                 win.vsplit.setSizes([0, tot])                                   # only the plots here: the map is not needed
@@ -23684,6 +23692,7 @@ class InterfPanel(W.QWidget):
         try:
             tab, summ = vc.rm_panel(self.s, self.detail["raw"], self.s.interf)
             self._rmkey = key
+            self.rm_data = (tab, summ)
         except Exception as e:
             self.rm_tab.setRowCount(0)
             self.rm_note.setText(str(e))
@@ -23872,6 +23881,283 @@ def std_layout(sess):
             if img and len(mine) >= 4 and len(mine) == len(ls):
                 d["maps"] += 1
     return out
+
+
+def _paint_plots(gw):
+    """Background, axes and titles of a GraphicsLayoutWidget in the chosen plot background (white unless Preferences say otherwise)."""
+    st = bg_style(GRAPH_BG or "white")
+    gw.setBackground(st["live"])
+    fg = QtGui.QColor(*st["fg"])
+    for it in list(gw.ci.items.keys()):
+        if isinstance(it, pg.PlotItem):
+            for ax in ("left", "bottom"):
+                it.getAxis(ax).setPen(fg)
+                it.getAxis(ax).setTextPen(fg)
+            if it.titleLabel.text:
+                it.setTitle(it.titleLabel.text, color=fg.name(), size="10pt")
+
+
+def std_groups(sess):
+    """The standards laid out for plotting: one group per laser image that holds only one material (a map) and one group per material for its
+    remaining lines. Each group is dict(rm, kind 'map' or 'lines', title, lines [StdLine in image order])."""
+    infos = [i for i in sess.infos if i.use]
+    by_image = {}
+    for i in infos:
+        by_image.setdefault((i.image_name or "").strip(), []).append(i)
+    map_img = set()
+    for img, ls in by_image.items():
+        rms = {i.rm for i in ls if i.role == "standard" and i.rm}
+        if img and len(ls) >= 4 and len(rms) == 1 and all(i.role == "standard" and i.rm for i in ls):
+            map_img.add(img)
+    maps, rest = {}, {}
+    for sl in sess.standards:
+        if not sl.info.rm:
+            continue
+        img = (sl.info.image_name or "").strip()
+        if img in map_img:
+            maps.setdefault((sl.info.rm, img), []).append(sl)
+        else:
+            rest.setdefault(sl.info.rm, []).append(sl)
+    out = []
+    for (rm, img), ls in sorted(maps.items()):
+        out.append(dict(rm=rm, kind="map", title=f"{rm}, map {img}" if img and img != rm else f"{rm}, map", lines=sorted(ls, key=lambda x: x.info.line_number)))
+    for rm, ls in sorted(rest.items()):
+        out.append(dict(rm=rm, kind="lines", title=f"{rm}, {len(ls)} line{'s' if len(ls) != 1 else ''}", lines=sorted(ls, key=lambda x: x.time_s)))
+    return out
+
+
+class StdGallery(W.QWidget):
+    """Every standard for one channel or ratio: a picture for each map, and the profiles of the lines for a material that was run as lines or spots.
+    Lines the calibration uses are marked green, those it leaves out red, so what is being averaged can be seen."""
+    RATIOS = (("206Pb/238U", "206Pb", "238U"), ("207Pb/206Pb", "207Pb", "206Pb"), ("208Pb/232Th", "208Pb", "232Th"))
+
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        v = W.QVBoxLayout(self)
+        r = W.QHBoxLayout()
+        self.ch = W.QComboBox()
+        self.scale = W.QComboBox()
+        self.scale.addItems(["log10", "linear"])
+        self.cmap = W.QComboBox()
+        self.cmap.addItems(CMAP_CHOICES)
+        self.cols = _spin(1, 8, 3, 0, 1)
+        for lab, w in (("Channel or ratio", self.ch), ("Scale", self.scale), ("Colours", self.cmap), ("Columns", self.cols)):
+            r.addWidget(W.QLabel(lab))
+            r.addWidget(w)
+        r.addStretch(1)
+        v.addLayout(r)
+        self.note = NoteLabel("")
+        self.note.setWordWrap(True)
+        v.addWidget(self.note)
+        self.glw = pg.GraphicsLayoutWidget()
+        v.addWidget(self.glw, 1)
+        self._labels = []
+        for w in (self.scale, self.cmap):
+            w.currentIndexChanged.connect(lambda _i: self.draw())
+        self.cols.valueChanged.connect(lambda _v: self.draw())
+        self.ch.currentIndexChanged.connect(lambda _i: self.draw())
+
+    def refresh(self):
+        s = self.win.s
+        labs = list(s.labels) if s.map is not None else []
+        items = [n for n, a, b in self.RATIOS if a in labs and b in labs] + labs
+        if items != self._labels:
+            cur = self.ch.currentText()
+            self.ch.blockSignals(True)
+            self.ch.clear()
+            self.ch.addItems(items)
+            if cur in items:
+                self.ch.setCurrentText(cur)
+            elif "238U" in items:
+                self.ch.setCurrentText("238U")
+            self.ch.blockSignals(False)
+            self._labels = items
+        self.draw()
+
+    def _values(self, sl, spec):
+        s = self.win.s
+        for n, a, b in self.RATIOS:
+            if n == spec:
+                ja, jb = s._chan.get(a), s._chan.get(b)
+                with np.errstate(all="ignore"):
+                    x = sl.cps[:, ja].astype(float) / np.where(sl.cps[:, jb] > 0, sl.cps[:, jb], np.nan)
+                break
+        else:
+            x = sl.cps[:, s._chan[spec]].astype(float)
+        return np.where(sl.mask, x, np.nan)
+
+    def draw(self):
+        s = self.win.s
+        g = self.glw
+        g.clear()
+        _paint_plots(g)
+        spec = self.ch.currentText()
+        if s.map is None or not s.standards or not spec:
+            self.note.setText("Build the map on the Import tab and assign standards (role and RM name) to see them here.")
+            return
+        groups = std_groups(s)
+        if not groups:
+            self.note.setText("No standard has a reference material name yet.")
+            return
+        status = {}
+        if "/" not in spec:
+            try:
+                rows, _n = vc.calib_series(s, spec, "")
+                status = {r["member"]: r["status"] for r in rows}
+            except Exception:
+                status = {}
+        log = self.scale.currentText() == "log10"
+        data = []
+        for gr in groups:
+            data.append([self._values(sl, spec) for sl in gr["lines"]])
+        allv = np.concatenate([x[np.isfinite(x) & ((x > 0) if log else True)] for d in data for x in d] or [np.zeros(0)])
+        if not allv.size:
+            self.note.setText("No usable pixels for this channel.")
+            return
+        tv = np.log10(allv) if log else allv
+        lo, hi = np.percentile(tv, [2, 98])
+        ncol = int(self.cols.value())
+        lut = get_lut(self.cmap.currentText())
+        col_of = {"used": (30, 150, 70), "rejected": (200, 50, 50)}
+        for k, (gr, d) in enumerate(zip(groups, data)):
+            if k and k % ncol == 0:
+                g.nextRow()
+            p = g.addPlot(title=gr["title"])
+            p.showGrid(x=True, y=True, alpha=0.15)
+            if gr["kind"] == "map":
+                npx = max(len(x) for x in d)
+                arr = np.full((len(d), npx), np.nan, np.float32)
+                for i, x in enumerate(d):
+                    arr[i, :len(x)] = x
+                if log:
+                    with np.errstate(all="ignore"):
+                        arr = np.where(arr > 0, np.log10(arr), np.nan).astype(np.float32)
+                img = pg.ImageItem(arr.T)
+                img.setLookupTable(lut)
+                img.setLevels((lo, hi))
+                p.addItem(img)
+                p.invertY(True)
+                p.setLabel("bottom", "pixel along the line")
+                p.setLabel("left", "line")
+                if status:
+                    sw = np.zeros((1, len(gr["lines"]), 4), np.uint8)
+                    for i, sl in enumerate(gr["lines"]):
+                        c = col_of.get(status.get(sl.info.member), (190, 190, 190))
+                        sw[0, i] = (*c, 255)
+                    simg = pg.ImageItem(sw, axisOrder="row-major")
+                    simg.setRect(QtCore.QRectF(-max(npx * 0.08, 2.5), 0, max(npx * 0.05, 1.5), len(gr["lines"])))
+                    p.addItem(simg)
+            else:
+                p.setLabel("bottom", "pixel along the line")
+                p.setLabel("left", spec)
+                if log:
+                    p.setLogMode(False, True)
+                for sl, x in zip(gr["lines"], d):
+                    st = status.get(sl.info.member)
+                    c = col_of.get(st, (120, 120, 120))
+                    ok = np.isfinite(x) & ((x > 0) if log else True)
+                    if ok.any():
+                        p.plot(np.arange(len(x))[ok], x[ok], pen=pg.mkPen(*c, 150, width=1))
+        _paint_plots(g)
+        n_used = sum(1 for v_ in status.values() if v_ == "used")
+        n_rej = sum(1 for v_ in status.values() if v_ == "rejected")
+        self.note.setText((f"{spec}. Green marks a line the calibration uses ({n_used}), red one it leaves out ({n_rej}). " if status else f"{spec}. ")
+                          + "Colour range is shared between the pictures, from the 2nd to the 98th percentile.")
+
+
+class CorrectionsView(W.QWidget):
+    """What the interference corrections did to the standards: for each material the measure now (ticked corrections) beside the measure with none."""
+    PANELS = (("weak", "Weak-signal bias, %"), ("e68", "206Pb/238U error, %"), ("c204", "204 signal, cps"), ("tw", "Tera-Wasserburg age error, %"))
+
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        v = W.QVBoxLayout(self)
+        self.note = NoteLabel("")
+        self.note.setWordWrap(True)
+        v.addWidget(self.note)
+        self.glw = pg.GraphicsLayoutWidget()
+        v.addWidget(self.glw, 1)
+
+    def refresh(self):
+        ip = self.win.interf_panel
+        try:
+            ip.update_rm_panel()
+        except Exception:
+            pass
+        g = self.glw
+        g.clear()
+        _paint_plots(g)
+        data = getattr(ip, "rm_data", None)
+        if not data:
+            self.note.setText("Nothing to compare yet. Run with the corrections on Automatic, or analyse in Advanced, Interferences.")
+            return
+        tab, summ = data
+        rms = [str(r) for r in tab["rm"]]
+        x = np.arange(len(rms), dtype=float)
+        for k, (key, title) in enumerate(self.PANELS):
+            if k and k % 2 == 0:
+                g.nextRow()
+            if key not in tab or not np.isfinite(np.asarray(tab[key], float)).any():
+                continue
+            p = g.addPlot(title=title)
+            p.showGrid(y=True, alpha=0.2)
+            now = np.nan_to_num(np.asarray(tab[key], float))
+            none = np.nan_to_num(np.asarray(tab[key + "_none"], float))
+            p.addItem(pg.BarGraphItem(x=x - 0.2, height=none, width=0.35, brush=pg.mkBrush(150, 150, 150), name="no corrections"))
+            p.addItem(pg.BarGraphItem(x=x + 0.2, height=now, width=0.35, brush=pg.mkBrush(40, 130, 90), name="ticked corrections"))
+            p.getAxis("bottom").setTicks([[(float(i), r) for i, r in enumerate(rms)]])
+            p.addLegend(offset=(5, 5))
+        _paint_plots(g)
+        n, z = summ["now"], summ["none"]
+        self.note.setText(f"All standards, grey with no corrections and green with the ticked ones. Smaller is better. Weak-signal bias {n['weak']:.0f}% (none {z['weak']:.0f}%), "
+                          f"206Pb/238U error {n['upb']:.0f}% (none {z['upb']:.0f}%).")
+
+
+class CalibWorkspace(W.QTabWidget):
+    """The plots of the Calibrate tab, in the space the map takes elsewhere: the standards as maps or lines, the trace element QA/QC, the U-Pb QA/QC,
+    what the corrections did, and the diagnostics of the empty masses."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        self.gallery = StdGallery(win)
+        self.tqa = TraceQADialog(win)
+        self.uqa = QADialog(win)
+        for d in (self.tqa, self.uqa):
+            d.setWindowFlags(Qt.WindowType.Widget)
+        self.corr = CorrectionsView(win)
+        self.addTab(self.gallery, "Standards")
+        self.addTab(self.tqa, "Trace element QA/QC")
+        self.addTab(self.uqa, "U-Pb QA/QC")
+        self.addTab(self.corr, "Corrections")
+        self.addTab(win.interf_panel.plot_box, "Empty masses")
+        self.currentChanged.connect(lambda _i: self.refresh_current())
+        win.quant_panel.qa = self.uqa
+        win.quant_panel.tqa = self.tqa
+
+    def refresh_current(self):
+        w = self.currentWidget()
+        try:
+            if w is self.gallery:
+                self.gallery.refresh()
+            elif w is self.tqa:
+                self.tqa.refresh()
+            elif w is self.uqa:
+                self.win.quant_panel.collect_upb()
+                self.uqa.refresh()
+            elif w is self.corr:
+                self.corr.refresh()
+            else:
+                self.win.interf_panel.update_views()
+        except Exception as e:
+            self.win.statusBar().showMessage(f"Could not draw this plot: {e}")
+
+    def show_page(self, w):
+        self.win.show_tab("Calibrate")
+        self.setCurrentWidget(w)
+        self.refresh_current()
 
 
 class CalibratePage(W.QScrollArea):
@@ -25152,6 +25438,7 @@ class MainWindow(W.QMainWindow):
         self.quant_panel = QuantPanel(self)
         q, ip = self.quant_panel, self.interf_panel
         self.calib_page = CalibratePage(self)
+        self.calib_ws = CalibWorkspace(self)
         box = W.QWidget()
         v = W.QVBoxLayout(box)
         v.setContentsMargins(4, 4, 4, 4)
@@ -25180,6 +25467,9 @@ class MainWindow(W.QMainWindow):
             self.sync_find_layers()
         if self.tab_name() == "Calibrate" and getattr(self, "calib_page", None) is not None:
             self.calib_page.refresh()
+            sizes = self.split.sizes()
+            if len(sizes) == 2 and sizes[1] < 520 and sum(sizes) > 900:
+                self.split.setSizes([sum(sizes) - 540, 540])
         if self.tab_name() == "Calibrate" and self.calib_page.f_q.head.isChecked():
             self.quant_panel.refill()
             sizes = self.split.sizes()
