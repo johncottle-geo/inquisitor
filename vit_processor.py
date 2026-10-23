@@ -19524,9 +19524,13 @@ class QuantPanel(W.QWidget):
         b1.clicked.connect(self.review)
         b2.clicked.connect(self.recovery)
         b3.clicked.connect(self.open_offsets)
+        b4 = W.QPushButton("Open trace QA/QC window")
+        b4.setToolTip("Interrogate the standards: matrix of offsets, profile per material, found against accepted, and the lines behind each channel")
+        b4.clicked.connect(self.open_trace_qa)
         r2.addWidget(b1)
         r2.addWidget(b2)
         r2.addWidget(b3)
+        r2.addWidget(b4)
         rl.addLayout(r2)
         self.rev_note = NoteLabel("")
         self.rev_note.setWordWrap(True)
@@ -19822,6 +19826,16 @@ class QuantPanel(W.QWidget):
         self.s.invalidate()
         self.review()
         self.win.refresh_display()
+
+    @safe
+    def open_trace_qa(self):
+        self.collect_trace()
+        d = getattr(self, "tqa", None)
+        if d is None or not d.isVisible():
+            d = self.tqa = TraceQADialog(self.win)
+        d.refresh()
+        d.show()
+        d.raise_()
 
     @safe
     def open_offsets(self):
@@ -20694,6 +20708,328 @@ class QADialog(W.QDialog):
         t_sum.to_csv(os.path.join(d, "upb_qaqc_dates_summary.csv"), index=False)
         lines.to_csv(os.path.join(d, "upb_qaqc_full_lines.csv"), index=False)       # with ratios, for reference
         summ.to_csv(os.path.join(d, "upb_qaqc_full_summary.csv"), index=False)
+
+
+def trace_qa_args(sess):
+    """Channels, method and internal standard the trace element quantification uses: the same rule the review section follows."""
+    cfg = sess.quant
+    is_ = ""
+    for mq in (cfg.minerals or {}).values():
+        if mq.method == "internal" and mq.internal:
+            is_ = mq.internal[0][0]
+            break
+    labs = [l for l in cfg.channels if l in sess.labels and l != is_]
+    return labs, ("internal" if is_ else "onepoint"), is_
+
+
+class TraceQADialog(W.QDialog):
+    """QA/QC of the trace element concentrations: the standards quantified as unknowns, then interrogated. Matrix of offsets (click a cell),
+    profile of one material across the masses, found against accepted, and the lines behind one channel with a say on each."""
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.setWindowTitle("Trace element QA/QC")
+        self.resize(1150, 780)
+        self.df = pd.DataFrame()
+        self.acc = {}
+        v = W.QVBoxLayout(self)
+        r = W.QHBoxLayout()
+        b = W.QPushButton("Refresh")
+        b.clicked.connect(self.refresh)
+        bs = W.QPushButton("Save table as CSV...")
+        bs.clicked.connect(self.save_csv)
+        r.addWidget(b)
+        r.addWidget(bs)
+        self.held = W.QComboBox()
+        self.held.addItems(["Held out (honest)", "In calibration"])
+        self.band = _spin(1, 100, 10.0, 0, 5, " %")
+        self.band.setToolTip("Offsets inside this band are shown as good")
+        for lab, w in (("Calibration", self.held), ("Good within", self.band)):
+            r.addWidget(W.QLabel(lab))
+            r.addWidget(w)
+        r.addStretch(1)
+        v.addLayout(r)
+        self.score = NoteLabel("")
+        self.score.setWordWrap(True)
+        v.addWidget(self.score)
+        self.tabs = W.QTabWidget()
+        v.addWidget(self.tabs, 1)
+        self.mat = W.QTableWidget(0, 0)
+        self.mat.setEditTriggers(W.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.mat.cellClicked.connect(self._cell)
+        mh = W.QWidget()
+        ml = W.QVBoxLayout(mh)
+        ml.setContentsMargins(0, 0, 0, 0)
+        ml.addWidget(NoteLabel("Offset of each element from its accepted value, in percent (0 is perfect). Click a cell to open that element and "
+                               "material on the Lines tab."))
+        ml.addWidget(self.mat, 1)
+        self.prof = AutoPlot()
+        self.prof.showGrid(x=True, y=True, alpha=0.2)
+        ph = W.QWidget()
+        pl = W.QVBoxLayout(ph)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pr = W.QHBoxLayout()
+        self.p_rm = W.QComboBox()
+        self.p_rm.currentIndexChanged.connect(lambda _i: self._profile())
+        pr.addWidget(W.QLabel("Material"))
+        pr.addWidget(self.p_rm)
+        pr.addStretch(1)
+        pl.addLayout(pr)
+        pl.addWidget(self.prof, 1)
+        self.fa = AutoPlot()
+        self.fa.showGrid(x=True, y=True, alpha=0.2)
+        self.lines_host = self._lines_build()
+        for w, n in ((mh, "Matrix"), (ph, "Profile"), (self.fa, "Found vs accepted"), (self.lines_host, "Lines")):
+            self.tabs.addTab(w, n)
+        self.held.currentIndexChanged.connect(lambda _i: self.refresh())
+        self.band.valueChanged.connect(lambda _v: self._draw())
+
+    # ---- data
+    def refresh(self):
+        s = self.win.s
+        W.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            labs, meth, is_ = trace_qa_args(s)
+            if not labs or not s.standards:
+                self.df = pd.DataFrame()
+                self.score.setText("Set up the trace element channels on the Quantify page first, and give the reference materials accepted values.")
+                self._draw()
+                return
+            self.args = (labs, meth, is_)
+            self.df = vc.trace_offsets(s, labs, meth, is_, s.quant.rms or None, held_out=self.held.currentIndex() == 0)
+            self.acc = {}
+            for rm in set(self.df.rm):
+                tab = s.rm_table.get(rm) or {}
+                for ch in labs:
+                    x = tab.get(vc.element_of(ch))
+                    if isinstance(x, (int, float, np.floating)) and np.isfinite(x) and x > 0:
+                        self.acc[(rm, ch)] = float(x)
+            try:
+                sc, _t = vc.trace_score(s)
+            except Exception:
+                sc = None
+            self.score.setText(("Overall score %.1f %% (root mean square of bias and scatter, standards held out where another of their kind exists). " % sc if sc is not None else "")
+                               + f"{len(set(self.df.rm))} reference materials, {len(set(self.df.channel))} channels"
+                               + (f", internal standard {is_}." if is_ else ", external calibration."))
+            cur = self.p_rm.currentText()
+            self.p_rm.blockSignals(True)
+            self.p_rm.clear()
+            self.p_rm.addItems(sorted(set(self.df.rm)))
+            if cur:
+                self.p_rm.setCurrentText(cur)
+            self.p_rm.blockSignals(False)
+            self.lc_ch.blockSignals(True)
+            cc = self.lc_ch.currentText()
+            self.lc_ch.clear()
+            self.lc_ch.addItems(labs)
+            if cc in labs:
+                self.lc_ch.setCurrentText(cc)
+            self.lc_ch.blockSignals(False)
+            self._draw()
+        except Exception as e:
+            self.score.setText(f"Could not compute the QA/QC: {e}")
+        finally:
+            W.QApplication.restoreOverrideCursor()
+
+    def _draw(self):
+        self._matrix()
+        self._profile()
+        self._found()
+        self._lines()
+
+    def _matrix(self):
+        t, df = self.mat, self.df
+        t.clear()
+        if not len(df):
+            t.setRowCount(0)
+            t.setColumnCount(0)
+            return
+        chs = sorted(set(df.channel), key=_mass_key_ui)
+        rms = sorted(set(df.rm))
+        t.setRowCount(len(chs))
+        t.setColumnCount(len(rms))
+        t.setHorizontalHeaderLabels(rms)
+        t.setVerticalHeaderLabels(chs)
+        band = self.band.value()
+        idx = {(r.rm, r.channel): r for r in df.itertuples()}
+        for i, ch in enumerate(chs):
+            for j, rm in enumerate(rms):
+                r = idx.get((rm, ch))
+                if r is None:
+                    continue
+                it = W.QTableWidgetItem(f"{r.offset_pct:+.1f}")
+                a = abs(r.offset_pct)
+                col = "#d6efdc" if a <= band else ("#fbe9c6" if a <= 2 * band else "#f4cfcb")
+                it.setBackground(QtGui.QColor(col))
+                it.setForeground(QtGui.QColor("#000000"))
+                it.setToolTip(f"{ch} in {rm}: {r.offset_pct:+.1f} % from accepted, scatter {r.spread_pct:.1f} % over {int(r.lines)} lines")
+                it.setData(Qt.ItemDataRole.UserRole, (rm, ch))
+                t.setItem(i, j, it)
+        t.resizeColumnsToContents()
+
+    def _cell(self, i, j):
+        it = self.mat.item(i, j)
+        d = it.data(Qt.ItemDataRole.UserRole) if it is not None else None
+        if d:
+            self.lc_ch.setCurrentText(d[1])
+            self.lc_rm = d[0]
+            self._lines()
+            self.tabs.setCurrentIndex(3)
+
+    def _profile(self):
+        p, df = self.prof, self.df
+        p.clear()
+        p.setLabel("left", "offset from accepted (%)")
+        p.setLabel("bottom", "element, in mass order")
+        rm = self.p_rm.currentText()
+        d = df[df.rm == rm] if len(df) else df
+        if not len(d):
+            return
+        d = d.assign(_k=[_mass_key_ui(c) for c in d.channel]).sort_values("_k")
+        x = np.arange(len(d), dtype=float)
+        y = d.offset_pct.to_numpy(float)
+        e = np.nan_to_num(d.se2_pct.to_numpy(float), nan=0.0)
+        b = self.band.value()
+        p.addItem(pg.LinearRegionItem([-b, b], orientation="horizontal", movable=False, brush=pg.mkBrush(60, 160, 90, 40), pen=pg.mkPen(None)))
+        p.addLine(y=0, pen=pg.mkPen("k", width=1))
+        ok = np.abs(y) <= b
+        p.addItem(pg.ErrorBarItem(x=x, y=y, height=2 * e, beam=0.2, pen=pg.mkPen("#666666")))
+        for sel, col in ((ok, "#2e8b57"), (~ok, "#c0392b")):
+            if sel.any():
+                p.addItem(pg.ScatterPlotItem(x[sel], y[sel], size=9, pen=pg.mkPen(col), brush=pg.mkBrush(col)))
+        p.getAxis("bottom").setTicks([[(float(i), str(c)) for i, c in enumerate(d.channel)]])
+
+    def _found(self):
+        p, df = self.fa, self.df
+        p.clear()
+        p.setLogMode(True, True)
+        p.setLabel("bottom", "accepted (ppm)")
+        p.setLabel("left", "found (ppm)")
+        if not len(df):
+            return
+        rms = sorted(set(df.rm))
+        lo, hi = np.inf, 0.0
+        for i, rm in enumerate(rms):
+            d = df[df.rm == rm]
+            xs = np.array([self.acc.get((rm, c), np.nan) for c in d.channel])
+            ys = xs * (1 + d.offset_pct.to_numpy(float) / 100)
+            ok = np.isfinite(xs) & np.isfinite(ys) & (xs > 0) & (ys > 0)
+            if ok.any():
+                col = pg.intColor(i, max(3, len(rms)))
+                p.addItem(pg.ScatterPlotItem(np.log10(xs[ok]), np.log10(ys[ok]), size=8, pen=pg.mkPen(col), brush=pg.mkBrush(col), name=rm))
+                lo, hi = min(lo, xs[ok].min()), max(hi, xs[ok].max())
+        if np.isfinite(lo) and hi > 0:
+            a, b = np.log10(lo) - 0.3, np.log10(hi) + 0.3
+            p.plot([10 ** a, 10 ** b], [10 ** a, 10 ** b], pen=pg.mkPen("k", width=1))      # a plot item takes raw values in log mode, a scatter item takes their log
+            bd = self.band.value() / 100
+            for f in (1 + bd, 1 - bd):
+                p.plot([10 ** a, 10 ** b], [f * 10 ** a, f * 10 ** b], pen=pg.mkPen("#888888", style=Qt.PenStyle.DashLine))
+        p.addLegend(offset=(10, 10))
+
+    # ---- lines of one channel
+    def _lines_build(self):
+        h = W.QWidget()
+        v = W.QVBoxLayout(h)
+        v.setContentsMargins(0, 0, 0, 0)
+        r = W.QHBoxLayout()
+        self.lc_ch = W.QComboBox()
+        self.lc_ch.currentIndexChanged.connect(lambda _i: self._lines())
+        self.lc_rm = ""
+        r.addWidget(W.QLabel("Channel"))
+        r.addWidget(self.lc_ch)
+        r.addStretch(1)
+        v.addLayout(r)
+        self.lc_note = NoteLabel("")
+        self.lc_note.setWordWrap(True)
+        v.addWidget(self.lc_note)
+        self.lc_plot = AutoPlot()
+        self.lc_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.lc_plot.setMinimumHeight(260)
+        v.addWidget(self.lc_plot, 2)
+        self.lc_tab = W.QTableWidget(0, 6)
+        v.addWidget(self.lc_tab, 1)
+        return h
+
+    def _lines(self):
+        s = self.win.s
+        ch = self.lc_ch.currentText()
+        p = self.lc_plot
+        p.clear()
+        if not ch or not hasattr(self, "args"):
+            return
+        _labs, _m, is_ = self.args
+        try:
+            rows, notes, curve = vc.quant_review(s, ch, is_)
+        except Exception as e:
+            self.lc_note.setText(f"Could not read the lines of {ch}: {e}")
+            return
+        self.lc_note.setText(f"{ch}" + (f" / {is_}" if is_ else " (cps per ppm)") + ". " + " ".join(notes)
+                             + " Points are the sensitivity found on each standard line, the curve is the drift fit. Hollow points are left out.")
+        p.setLabel("left", "relative sensitivity" if is_ else "cps per ppm")
+        p.setLabel("bottom", "minutes into the session")
+        t0 = min((r["time"] for r in rows if np.isfinite(r["time"])), default=0.0)
+        rmn = sorted({r["rm"] for r in rows})
+        for i, rm in enumerate(rmn):
+            col = pg.intColor(i, max(3, len(rmn)))
+            big = 12 if rm == self.lc_rm else 8
+            for st, filled in (("used", True), ("rejected", False)):
+                pts = [r for r in rows if r["rm"] == rm and r["status"] == st and np.isfinite(r["value"])]
+                if pts:
+                    p.addItem(pg.ScatterPlotItem([(r["time"] - t0) / 60 for r in pts], [r["value"] for r in pts], size=big,
+                                                 pen=pg.mkPen(col, width=2), brush=pg.mkBrush(col) if filled else pg.mkBrush(None)))
+        if curve is not None and rows:
+            tt = np.linspace(min(r["time"] for r in rows), max(r["time"] for r in rows), 80)
+            try:
+                p.plot((tt - t0) / 60, curve(tt), pen=pg.mkPen("k", width=2))
+            except Exception:
+                pass
+        tb = self.lc_tab
+        tb.setSortingEnabled(False)
+        tb.setHorizontalHeaderLabels(["Line", "RM", "Value", "Residual %", "Status", "Your choice"])
+        tb.setRowCount(len(rows))
+        ov = s.quant.line_override
+        for k, row in enumerate(sorted(rows, key=lambda x: x["time"])):
+            vals = [row["name"], row["rm"], row["value"], row.get("residual_pct", np.nan),
+                    row["status"] + (f": {row['reason']}" if row["reason"] else "")]
+            for c, x in enumerate(vals):
+                it = NumItem(x)
+                if c == 4:
+                    it.setForeground(QtGui.QColor(STATUS_COL.get(row["status"], "#000000")))
+                tb.setItem(k, c, it)
+            cb = W.QComboBox()
+            cb.addItems(["auto", "use", "skip"])
+            cb.setCurrentText({True: "use", False: "skip"}.get(ov.get(row["member"]), "auto"))
+            cb.setEnabled(bool(row["status"] != "off" and np.isfinite(row["value"])))
+            cb.currentTextChanged.connect(lambda txt, m=row["member"]: self._override(m, txt))
+            tb.setCellWidget(k, 5, cb)
+        tb.resizeColumnsToContents()
+
+    def _override(self, member, txt):
+        ov = self.win.s.quant.line_override
+        if txt == "auto":
+            ov.pop(member, None)
+        else:
+            ov[member] = txt == "use"
+        self.win.s.invalidate()
+        self.refresh()
+        try:
+            self.win.refresh_display()
+        except Exception:
+            pass
+
+    def save_csv(self):
+        if not len(self.df):
+            return
+        d = self.df.copy()
+        d["accepted_ppm"] = [self.acc.get((r, c), np.nan) for r, c in zip(d.rm, d.channel)]
+        p, _ = W.QFileDialog.getSaveFileName(self, "Save trace element QA/QC", "trace_element_qaqc.csv", "CSV (*.csv)")
+        if p:
+            d.to_csv(p, index=False)
+
+
+def _mass_key_ui(name):
+    return vc._mass_key(name)
 
 
 class OffsetDialog(W.QDialog):
