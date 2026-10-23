@@ -23875,7 +23875,7 @@ def std_layout(sess):
 
 
 class CalibratePage(W.QScrollArea):
-    """The front page of the Calibrate tab: the standards, the corrections, how the standards come out, and one Calibrate button.
+    """The Calibrate tab: the standards, a card each for trace elements and U-Pb (run, check the standards, QA/QC) and the interference corrections as their background.
     Every detailed setting stays on the Interferences and Quantify pages next to it. This page reads and writes the widgets of those pages,
     so the two always agree."""
     FAMILIES = (("Gas blank and pedestal", ("pedestal", "gas blank")), ("Isobars", ("isobar",)), ("Oxides", ("oxide",)),
@@ -23890,6 +23890,7 @@ class CalibratePage(W.QScrollArea):
         self._expanded = False
         self.setWidgetResizable(True)
         self.setFrameShape(W.QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         body = W.QWidget()
         self.setWidget(body)
         v = W.QVBoxLayout(body)
@@ -23899,30 +23900,6 @@ class CalibratePage(W.QScrollArea):
         head.addWidget(self.chip)
         head.addStretch(1)
         v.addLayout(head)
-
-        g = W.QGroupBox()
-        gv = W.QVBoxLayout(g)
-        r = W.QHBoxLayout()
-        self.b_run = W.QPushButton("Calibrate")
-        self.b_run.setObjectName("primary")
-        self.b_run.setMinimumHeight(36)
-        self.b_run.setToolTip("Learns the corrections from your standards, rebuilds the map, picks the U-Pb strategy and makes the ppm and U-Pb layers")
-        self.b_run.clicked.connect(lambda: self.run())
-        r.addWidget(self.b_run)
-        self.auto = W.QCheckBox("Choose corrections automatically")
-        self.auto.setChecked(True)
-        self.auto.setToolTip("On: Calibrate first learns the corrections, tunes them and rebuilds the map, then calibrates. "
-                             "Off: Calibrate uses the corrections you ticked below as they are")
-        r.addWidget(self.auto)
-        r.addStretch(1)
-        gv.addLayout(r)
-        self.keep = W.QCheckBox("Keep my U-Pb primary and secondary choices")
-        self.keep.setToolTip("Off: the automatic choice may change which standards are primary, secondary or unused. On: your choices stay and only the Morgan coefficients are refitted")
-        gv.addWidget(self.keep)
-        gv.addWidget(NoteLabel("Ticking a correction below rebuilds the map at once. Untick the automatic box to choose them yourself."))
-        self.note = NoteLabel("")
-        gv.addWidget(self.note)
-        v.addWidget(g)
 
         g1 = W.QGroupBox("1  Standards")
         v1 = W.QVBoxLayout(g1)
@@ -23942,46 +23919,28 @@ class CalibratePage(W.QScrollArea):
         v1.addWidget(self.std)
         v.addWidget(g1)
 
-        g2 = W.QGroupBox("2  Corrections")
-        v2 = W.QVBoxLayout(g2)
-        r = W.QHBoxLayout()
-        self.b_expand = W.QPushButton("Show individual corrections")
-        self.b_expand.setCheckable(True)
-        self.b_expand.toggled.connect(self._expand)
-        r.addWidget(self.b_expand)
-        b_test = W.QPushButton("Test each on the standards")
-        b_test.setToolTip("Adds the Helps, Hurts or Mixed verdict: every correction is judged by how well the standards agree with it in and out. It can take a few minutes")
-        b_test.clicked.connect(lambda: self.test())
-        r.addWidget(b_test)
-        r.addStretch(1)
-        v2.addLayout(r)
-        self.tree = W.QTreeWidget()
-        self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["Correction", "Effect", "Verdict"])
-        self.tree.setRootIsDecorated(False)
-        self.tree.setMinimumHeight(190)
-        self.tree.header().setStretchLastSection(False)
-        self.tree.header().setSectionResizeMode(0, W.QHeaderView.ResizeMode.Stretch)
-        self.tree.header().setSectionResizeMode(1, W.QHeaderView.ResizeMode.ResizeToContents)
-        self.tree.header().setSectionResizeMode(2, W.QHeaderView.ResizeMode.ResizeToContents)
-        self.tree.itemChanged.connect(self._tree_changed)
-        v2.addWidget(self.tree)
-        self.corr_note = NoteLabel("")
-        v2.addWidget(self.corr_note)
-        v.addWidget(g2)
-        self._timer = QtCore.QTimer(self)
-        self._timer.setSingleShot(True)
-        self._timer.timeout.connect(lambda: self._rebuild_now())
+        def card_buttons(layout, run_text, run_tip, run_fn, check_fn, qa_fn, page):
+            rr = W.QHBoxLayout()
+            br = W.QPushButton(run_text)
+            br.setObjectName("primary")
+            br.setMinimumHeight(34)
+            br.setToolTip(run_tip)
+            br.clicked.connect(run_fn)
+            bc = W.QPushButton("Check standards")
+            bc.setToolTip("Quantify the standards as unknowns and list how far each is from its accepted value")
+            bc.clicked.connect(check_fn)
+            bq = W.QPushButton("QA/QC")
+            bq.setToolTip("Every standard and every line, with plots")
+            bq.clicked.connect(qa_fn)
+            bs = W.QPushButton("Settings")
+            bs.clicked.connect(lambda: self.open_quant(page))
+            for x in (br, bc, bq, bs):
+                rr.addWidget(x)
+            rr.addStretch(1)
+            layout.addLayout(rr)
+            return br
 
-        g3 = W.QGroupBox("3  How the standards come out")
-        v3 = W.QVBoxLayout(g3)
-        v3.addWidget(NoteLabel("Each standard quantified as an unknown. In brackets: with no corrections. Smaller is better."))
-        ip = win.interf_panel
-        v3.addWidget(ip.rm_tab)
-        v3.addWidget(ip.rm_note)
-        v.addWidget(g3)
-
-        g4 = W.QGroupBox("4  Trace elements")
+        g4 = W.QGroupBox("2  Trace elements")
         v4 = W.QVBoxLayout(g4)
         self.q_trace = W.QLabel("")
         self.q_trace.setWordWrap(True)
@@ -23991,54 +23950,97 @@ class CalibratePage(W.QScrollArea):
         self.t_min.horizontalHeader().setSectionResizeMode(2, W.QHeaderView.ResizeMode.Stretch)
         self.t_min.setToolTip("The same table as Advanced, Quantify, Trace elements. internal: ratio to an internal standard. onepoint: cps per ppm of the standards. sum: oxide sum")
         v4.addWidget(self.t_min)
-        rr = W.QHBoxLayout()
-        b = self.b_ppm = W.QPushButton("Make ppm layers")
-        b.setToolTip("Write the settings and make the ppm: layers for the ticked channels (Advanced, Quantify, Trace elements, Channels that get ppm)")
-        b.clicked.connect(self._make_ppm)
-        b2 = W.QPushButton("Check the standards")
-        b2.setToolTip("Open the trace element QA/QC window: offsets of every standard, per element and per line")
-        b2.clicked.connect(lambda: self.win.quant_panel.open_trace_qa())
-        b3 = W.QPushButton("Settings...")
-        b3.clicked.connect(lambda: self.open_quant(0))
-        for x in (b, b2, b3):
-            rr.addWidget(x)
-        rr.addStretch(1)
-        v4.addLayout(rr)
+        self.b_ppm = card_buttons(v4, "Run trace elements", "Applies the corrections (as set in section 4), calibrates on the standards and makes the ppm: layers",
+                                  lambda: self.run_trace(), lambda: self.check_trace(), lambda: self.win.quant_panel.open_trace_qa(), 0)
+        self.t_chk = W.QTableWidget(0, 4)
+        self.t_chk.setHorizontalHeaderLabels(["Standard", "Lines", "Bias, %", "Scatter, %"])
+        self.t_chk.verticalHeader().setVisible(False)
+        self.t_chk.horizontalHeader().setStretchLastSection(True)
+        self.t_chk.setEditTriggers(W.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.t_chk.setVisible(False)
+        v4.addWidget(self.t_chk)
         self.t_res = NoteLabel("")
         self.t_res.setWordWrap(True)
         v4.addWidget(self.t_res)
         v.addWidget(g4)
 
-        g5 = W.QGroupBox("5  U-Pb")
+        g5 = W.QGroupBox("3  U-Pb")
         v5 = W.QVBoxLayout(g5)
         self.q_upb = W.QLabel("")
         self.q_upb.setWordWrap(True)
         v5.addWidget(self.q_upb)
         self.u_morgan = W.QCheckBox("Morgan background correction")
-        self.u_morgan.setToolTip("Same switch as Advanced, Quantify, U-Pb. Correct and check keeps it only when it clearly helps the secondary standards")
+        self.u_morgan.setToolTip("Same switch as Advanced, Quantify, U-Pb. Run keeps it only when it clearly helps the secondary standards")
         self.u_morgan.toggled.connect(lambda on: self.win.quant_panel.m_on.setChecked(on))
-        v5.addWidget(self.u_morgan)
-        rr = W.QHBoxLayout()
-        bu = self.b_upb = W.QPushButton("Correct and check")
-        bu.setToolTip("Takes the background off, tests Morgan against the secondary standards, makes the U-Pb layers and opens the QA/QC window")
-        bu.clicked.connect(self._upb_check)
-        bl = W.QPushButton("Make U-Pb layers")
-        bl.clicked.connect(self._make_upb)
-        bq = W.QPushButton("QA/QC")
-        bq.clicked.connect(lambda: self.win.quant_panel.open_qa())
-        bs = W.QPushButton("Best strategy...")
-        bs.setToolTip("Try primary standards, drift models, outlier limits and Morgan, and rank them by how accurately the other standards come out")
-        bs.clicked.connect(lambda: self.win.quant_panel.find_strategy())
-        bk = W.QPushButton("Settings...")
-        bk.clicked.connect(lambda: self.open_quant(1))
-        for x in (bu, bl, bq, bs, bk):
-            rr.addWidget(x)
-        rr.addStretch(1)
-        v5.addLayout(rr)
+        mr = W.QHBoxLayout()
+        mr.addWidget(self.u_morgan)
+        v5.addLayout(mr)
+        self.u_keep = W.QCheckBox("Keep my primary and secondary choices")
+        self.u_keep.setToolTip("Off: Run picks the U-Pb strategy (primary standards, drift, outlier limit, Morgan). On: your roles stay and only Morgan is refitted")
+        v5.addWidget(self.u_keep)
+        self.b_upb = card_buttons(v5, "Run U-Pb", "Applies the corrections (as set in section 4), picks the U-Pb strategy and makes the U-Pb layers",
+                                  lambda: self.run_upb(), lambda: self.check_upb(), lambda: self.win.quant_panel.open_qa(), 1)
+        bst = W.QPushButton("Best strategy...")
+        mr.addStretch(1)
+        bst.setToolTip("Try primary standards, drift models, outlier limits and Morgan, and rank them by how accurately the other standards come out")
+        bst.clicked.connect(lambda: self.win.quant_panel.find_strategy())
+        mr.addWidget(bst)
+        self.u_chk2 = W.QTableWidget(0, 5)
+        self.u_chk2.setHorizontalHeaderLabels(["Standard", "Lines", "206Pb/238U offset, %", "2 SE, %", "Within band"])
+        self.u_chk2.verticalHeader().setVisible(False)
+        self.u_chk2.horizontalHeader().setStretchLastSection(True)
+        self.u_chk2.setEditTriggers(W.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.u_chk2.setVisible(False)
+        v5.addWidget(self.u_chk2)
         self.u_res = NoteLabel("")
         self.u_res.setWordWrap(True)
         v5.addWidget(self.u_res)
         v.addWidget(g5)
+
+        g2 = W.QGroupBox("4  Interference corrections")
+        v2 = W.QVBoxLayout(g2)
+        v2.addWidget(NoteLabel("These run in the background of the two runs above. Automatic learns them from your standards and keeps the ones that help. "
+                               "Manual uses the ones you tick. Off applies none."))
+        r = W.QHBoxLayout()
+        r.addWidget(W.QLabel("Corrections"))
+        self.mode = W.QComboBox()
+        self.mode.addItems(["Automatic", "Manual", "Off"])
+        self.mode.setToolTip("Automatic: each Run learns the corrections first. Manual: the ticked corrections are applied as they are. Off: none")
+        self.mode.currentIndexChanged.connect(self._mode_changed)
+        r.addWidget(self.mode)
+        b_test = W.QPushButton("Assess")
+        b_test.setToolTip("Adds the Helps, Hurts or Mixed verdict: every correction is judged by how well the standards agree with it in and out. It can take a few minutes")
+        b_test.clicked.connect(lambda: self.test())
+        r.addWidget(b_test)
+        r.addStretch(1)
+        v2.addLayout(r)
+        self.corr_sum = W.QLabel("")
+        self.corr_sum.setWordWrap(True)
+        v2.addWidget(self.corr_sum)
+        self.f_corr = Fold("Individual corrections and what they did to the standards", False)
+        self.tree = W.QTreeWidget()
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["Correction", "Effect", "Verdict"])
+        self.tree.setRootIsDecorated(True)
+        self.tree.setMinimumHeight(190)
+        self.tree.header().setStretchLastSection(False)
+        self.tree.header().setSectionResizeMode(0, W.QHeaderView.ResizeMode.Stretch)
+        self.tree.header().setSectionResizeMode(1, W.QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(2, W.QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.itemChanged.connect(self._tree_changed)
+        self.f_corr.add(self.tree)
+        self.corr_note = NoteLabel("")
+        self.f_corr.add(self.corr_note)
+        ip = win.interf_panel
+        self.f_corr.add(NoteLabel("Each standard quantified as an unknown. In brackets: with no corrections. Smaller is better."))
+        self.f_corr.add(ip.rm_tab)
+        self.f_corr.add(ip.rm_note)
+        v2.addWidget(self.f_corr)
+        v.addWidget(g2)
+        self._expanded = True
+        self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(lambda: self._rebuild_now())
 
         self.f_int = Fold("Advanced: interferences, every setting and table behind the corrections")
         self.f_int.add(self.win.interf_panel)
@@ -24159,12 +24161,6 @@ class CalibratePage(W.QScrollArea):
                 return name
         return "Other"
 
-    def _expand(self, on):
-        self._expanded = bool(on)
-        self.b_expand.setText("Hide individual corrections" if on else "Show individual corrections")
-        self.tree.setRootIsDecorated(bool(on))
-        (self.tree.expandAll if on else self.tree.collapseAll)()
-
     def refresh_corrections(self):
         s, ip = self.s, self.win.interf_panel
         rules = s.interf.rules
@@ -24208,7 +24204,8 @@ class CalibratePage(W.QScrollArea):
                     top.setForeground(2, QtGui.QBrush(QtGui.QColor(110, 108, 100)))
                 top.setExpanded(self._expanded)
             self.tree.setRootIsDecorated(self._expanded)
-            self.corr_note.setText("" if rules else "No corrections yet. Press Calibrate with the automatic box ticked, or use the Interferences page to analyse.")
+            self.corr_note.setText("" if rules else "No corrections yet. Run with the corrections on Automatic learns them, or use the Interferences page in Advanced.")
+            self.refresh_corr_summary()
         finally:
             self._busy = False
 
@@ -24246,11 +24243,176 @@ class CalibratePage(W.QScrollArea):
         ip.update_rm_panel()
         self.refresh()
 
+    # ---- corrections mode
+    def _mode_changed(self, _i=0):
+        if self._busy:
+            return
+        if self.mode.currentText() == "Off" and self.s.interf.rules:
+            for r in self.s.interf.rules:
+                r.enabled = False
+            self.refresh_corrections()
+            self._chip_now()
+            self._timer.start(900)
+        self.refresh_corr_summary()
+
+    def refresh_corr_summary(self):
+        rules = self.s.interf.rules
+        on = sum(1 for r in rules if r.enabled)
+        m = self.mode.currentText()
+        if m == "Off":
+            t = "No corrections are applied."
+        elif not rules:
+            t = "No corrections learned yet. " + ("Run learns them from your standards." if m == "Automatic" else "Use Assess, or switch to Automatic.")
+        else:
+            t = f"{on} of {len(rules)} corrections on."
+            vs = [self.win.interf_panel.verdicts.get(r.id) for r in rules if r.enabled]
+            if vs and any(vs):
+                t += f" Verdicts of the ones on: {sum(v == 'helps' for v in vs)} help, {sum(v == 'hurts' for v in vs)} hurt, {sum(v in ('mixed', 'no clear effect') for v in vs)} unclear."
+        self.corr_sum.setText(t)
+
+    # ---- the two runs
+    def _guard(self):
+        s = self.s
+        if s.source is None:
+            raise ValueError(vc.NO_SOURCE)
+        if s.map is None:
+            raise ValueError("Build the map once on the Import tab (pick the channels first), set the standards, then come back")
+
+    def _corrections_step(self, strategy):
+        """The background of a run: learn the corrections (Automatic), or make sure the map holds the ticked ones (Manual, Off)."""
+        s, q, ip = self.s, self.win.quant_panel, self.win.interf_panel
+        for f in (q.collect_trace, q.collect_upb):          # the optimiser scores what is set up now
+            try:
+                f()
+            except ValueError:
+                pass
+        if self.mode.currentText() != "Automatic":
+            self._rebuild_now()
+            return ""
+        self._set_chip("Learning the corrections...", "busy")
+        W.QApplication.processEvents()
+        ip.quiet = True
+        ip.last_workflow = None
+        try:
+            res = ip._optimize(apply_strategy=strategy)
+            if ip.detail is not None and len({str(x) for x in np.asarray(ip.detail["raw"].rm_of)}) >= 2:
+                try:
+                    type(ip).validate.__wrapped__(ip)                # the verdicts; a failure here is not a failure of the run
+                except Exception:
+                    pass
+        except (ValueError, vc.CalibError) as e:
+            return f"Corrections skipped ({e}). "
+        finally:
+            ip.quiet = False
+        self._learned_for = id(s.map)
+        return f"Kept {res['winner']}. "
+
+    @safe
+    def run_trace(self):
+        self._guard()
+        q = self.win.quant_panel
+        self.b_ppm.setEnabled(False)
+        try:
+            note = ""
+            if self.mode.currentText() != "Automatic" or getattr(self, "_learned_for", None) != id(self.s.map):
+                note = self._corrections_step(False)
+            q.apply_trace()
+        finally:
+            self.b_ppm.setEnabled(True)
+        self.refresh()
+        self.check_trace(note)
+
+    @safe
+    def run_upb(self):
+        self._guard()
+        q = self.win.quant_panel
+        self.b_upb.setEnabled(False)
+        try:
+            note = self._corrections_step(not self.u_keep.isChecked())
+            q.apply_upb()
+        finally:
+            self.b_upb.setEnabled(True)
+        self.refresh()
+        self.check_upb(note)
+
+    # ---- the standards check, the same for both
+    def check_trace(self, note=""):
+        s, q = self.s, self.win.quant_panel
+        self.t_chk.setVisible(False)
+        try:
+            q.collect_trace()
+            sc, tab = vc.trace_score(s)
+        except Exception as e:
+            self.t_res.setText(note + f"Could not check the standards: {e}")
+            return
+        if sc is None or tab is None or not len(tab):
+            self.t_res.setText(note + "Nothing to check yet: set the standards' accepted values and the channels that get ppm.")
+            return
+        rows = []
+        for rm, d in tab.groupby("rm"):
+            bias = d["recovery_pct"].to_numpy(float) - 100.0
+            spr = np.nan_to_num(d["spread_pct"].to_numpy(float), nan=0.0)
+            rows.append((str(rm), int(round(d["lines"].mean())), float(np.sqrt(np.mean(bias ** 2))), float(np.sqrt(np.mean(spr ** 2)))))
+        t = self.t_chk
+        t.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            for j, x in enumerate(r):
+                t.setItem(i, j, NumItem(x if j < 2 else round(x, 1)))
+        t.resizeColumnsToContents()
+        fit_table_height(t, 1, 10)
+        t.setVisible(True)
+        nu = nr = 0
+        for lab in [l for l in s.quant.channels if l in s.labels][:40]:
+            try:
+                rr, _n = vc.calib_series(s, lab, "")
+            except Exception:
+                continue
+            nu += sum(r["status"] == "used" for r in rr)
+            nr += sum(r["status"] == "rejected" for r in rr)
+        held = bool(tab.attrs.get("held_out"))
+        self.t_res.setText(note + f"Score {sc:.1f} % ({'standards held out' if held else 'standards in their own calibration'}). Lines in use across the channels: {nu}, rejected: {nr}. "
+                           "Bias and scatter are the root mean square over the elements.")
+
+    def check_upb(self, note=""):
+        s, q = self.s, self.win.quant_panel
+        self.u_chk2.setVisible(False)
+        try:
+            q.collect_upb()
+            _lines, summ, _notes, _x = vc.upb_qaqc(s)
+        except Exception as e:
+            self.u_res.setText(note + f"Could not check the standards: {e}")
+            return
+        sec = summ[summ.role == "secondary"] if len(summ) else summ
+        if not len(sec):
+            self.u_res.setText(note + "Mark at least one standard as secondary (section 1) to check the U-Pb against it.")
+            return
+        t = self.u_chk2
+        t.setRowCount(len(sec))
+        bad = []
+        for i, (_, row) in enumerate(sec.iterrows()):
+            off, se = row.get("206Pb/238U_pct", np.nan), row.get("206Pb/238U_2se_pct", np.nan)
+            ok = bool(abs(off) <= s.upb.tol_pct) if np.isfinite(off) else False
+            if not ok:
+                bad.append(str(row["rm"]))
+            vals = [str(row["rm"]), str(int(row["lines"])), f"{off:+.1f}" if np.isfinite(off) else "", f"{se:.1f}" if np.isfinite(se) else "", "yes" if ok else "no"]
+            for j, x in enumerate(vals):
+                it = W.QTableWidgetItem(x)
+                if j == 4:
+                    it.setForeground(QtGui.QColor("#1a7f37" if ok else "#b42318"))
+                t.setItem(i, j, it)
+        t.resizeColumnsToContents()
+        fit_table_height(t, 1, 10)
+        t.setVisible(True)
+        u = s.upb
+        self.u_res.setText(note + (f"Outside the {u.tol_pct:g} % band: {', '.join(bad)}. Look at their lines in the QA/QC window before you trust them." if bad
+                                   else f"All secondary standards are within the {u.tol_pct:g} % band.")
+                           + f" Primary {', '.join(u.primary)}, {u.drift} drift, Morgan {'on' if u.morgan else 'off'}.")
+
     @safe
     def test(self):
         ip = self.win.interf_panel
         if ip.detail is None:
-            raise ValueError("Press Calibrate first, or analyse on the Interferences page, so there is something to test")
+            raise ValueError("Run once with the corrections on Automatic, or analyse on the Interferences page, so there is something to test")
         self._set_chip("Testing the corrections on the standards...", "busy")
         W.QApplication.processEvents()
         W.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -24324,49 +24486,6 @@ class CalibratePage(W.QScrollArea):
         self.q_trace.setText("<b>Trace elements</b>: " + (f"calibrated on {', '.join(rms)}" if rms else "no reference material ticked")
                              + (f". Minerals: {', '.join(mins)}." if mins else ". No mineral has a method yet."))
 
-    @safe
-    def _make_ppm(self):
-        self.win.quant_panel.apply_trace()
-        self.refresh_results()
-
-    @safe
-    def _make_upb(self):
-        self.win.quant_panel.apply_upb()
-        self.refresh_results()
-
-    @safe
-    def _upb_check(self):
-        self.win.quant_panel.correct_and_check()
-        self.refresh_quant()
-        self.refresh_results()
-
-    def refresh_results(self):
-        """What the standards look like now, one line per card: the overall trace score with how many lines the calibration uses, and the U-Pb check."""
-        s, q = self.s, self.win.quant_panel
-        try:
-            q.collect_trace()                         # the score reads the session, which holds what was last applied
-        except Exception:
-            pass
-        try:
-            sc, tab = vc.trace_score(s)
-            if sc is None:
-                self.t_res.setText("")
-            else:
-                nu = nr = 0
-                for lab in [l for l in s.quant.channels if l in s.labels][:40]:
-                    try:
-                        rows, _n = vc.calib_series(s, lab, "")
-                    except Exception:
-                        continue
-                    nu += sum(r["status"] == "used" for r in rows)
-                    nr += sum(r["status"] == "rejected" for r in rows)
-                held = bool(tab.attrs.get("held_out"))
-                self.t_res.setText(f"Standards as unknowns: score {sc:.1f} % ({'held out' if held else 'in calibration'}). "
-                                   f"Lines in use across the channels: {nu}, rejected: {nr}. Check the standards for the detail.")
-        except Exception:
-            self.t_res.setText("")
-        self.u_res.setText(q.u_check_note.text() if getattr(q, "u_check_note", None) is not None else "")
-
     def open_quant(self, page):
         q = self.win.quant_panel
         q.which.setCurrentIndex(page)
@@ -24374,44 +24493,6 @@ class CalibratePage(W.QScrollArea):
         self.ensureWidgetVisible(self.f_q)
 
     # ---- the one button
-    @safe
-    def run(self):
-        win, s = self.win, self.s
-        q, ip = win.quant_panel, win.interf_panel
-        if s.source is None:
-            raise ValueError(vc.NO_SOURCE)
-        if s.map is None:
-            raise ValueError("Build the map once on the Import tab (pick the channels first), set the standards, then come back")
-        q.all_opt.setChecked(self.auto.isChecked())
-        q.all_keep.setChecked(self.keep.isChecked())
-        self._set_chip("Calibrating...", "busy")
-        self.b_run.setEnabled(False)
-        W.QApplication.processEvents()
-        ip.quiet = True
-        ip.last_workflow = None
-        try:
-            q.apply_all()
-            if self.auto.isChecked() and ip.detail is not None and len({str(x) for x in np.asarray(ip.detail["raw"].rm_of)}) >= 2:
-                try:
-                    type(ip).validate.__wrapped__(ip)                # the verdicts; a failure here is not a failure of the calibration
-                except Exception:
-                    pass
-        finally:
-            ip.quiet = False
-            self.b_run.setEnabled(True)
-        self.refresh()
-        self.refresh_results()
-        res = ip.last_workflow
-        if res:
-            def f(x):
-                return "-" if x is None or not np.isfinite(x) else f"{x:.2f}"
-            fin = res["final"]
-            self.note.setText(f"Kept: {res['winner']}. U-Pb strategy score {f(res['base']['upb'])} % before, {f(fin['upb'])} % after. "
-                              f"Trace element recovery score {f(res['base']['trace'])} % before, {f(fin['trace'])} % after.")
-        else:
-            self.note.setText(q.all_note.text())
-
-
 class MainWindow(W.QMainWindow):
     def __init__(self):
         super().__init__()
