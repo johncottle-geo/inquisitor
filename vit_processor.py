@@ -23981,21 +23981,64 @@ class CalibratePage(W.QScrollArea):
         v3.addWidget(ip.rm_note)
         v.addWidget(g3)
 
-        g4 = W.QGroupBox("4  Quantify")
+        g4 = W.QGroupBox("4  Trace elements")
         v4 = W.QVBoxLayout(g4)
         self.q_trace = W.QLabel("")
         self.q_trace.setWordWrap(True)
+        v4.addWidget(self.q_trace)
+        self.t_min = W.QTableWidget(0, 3)
+        self.t_min.setHorizontalHeaderLabels(["Mineral", "Method", "Internal standard (channel=ppm)"])
+        self.t_min.horizontalHeader().setSectionResizeMode(2, W.QHeaderView.ResizeMode.Stretch)
+        self.t_min.setToolTip("The same table as Advanced, Quantify, Trace elements. internal: ratio to an internal standard. onepoint: cps per ppm of the standards. sum: oxide sum")
+        v4.addWidget(self.t_min)
+        rr = W.QHBoxLayout()
+        b = self.b_ppm = W.QPushButton("Make ppm layers")
+        b.setToolTip("Write the settings and make the ppm: layers for the ticked channels (Advanced, Quantify, Trace elements, Channels that get ppm)")
+        b.clicked.connect(self._make_ppm)
+        b2 = W.QPushButton("Check the standards")
+        b2.setToolTip("Open the trace element QA/QC window: offsets of every standard, per element and per line")
+        b2.clicked.connect(lambda: self.win.quant_panel.open_trace_qa())
+        b3 = W.QPushButton("Settings...")
+        b3.clicked.connect(lambda: self.open_quant(0))
+        for x in (b, b2, b3):
+            rr.addWidget(x)
+        rr.addStretch(1)
+        v4.addLayout(rr)
+        self.t_res = NoteLabel("")
+        self.t_res.setWordWrap(True)
+        v4.addWidget(self.t_res)
+        v.addWidget(g4)
+
+        g5 = W.QGroupBox("5  U-Pb")
+        v5 = W.QVBoxLayout(g5)
         self.q_upb = W.QLabel("")
         self.q_upb.setWordWrap(True)
-        for lab, page in ((self.q_trace, 0), (self.q_upb, 1)):
-            rr = W.QHBoxLayout()
-            rr.addWidget(lab, 1)
-            b = W.QPushButton("Change...")
-            b.clicked.connect(lambda _=False, p=page: self.open_quant(p))
-            rr.addWidget(b)
-            v4.addLayout(rr)
-        v4.addWidget(NoteLabel("The ppm and U-Pb layers are made each time Calibrate runs."))
-        v.addWidget(g4)
+        v5.addWidget(self.q_upb)
+        self.u_morgan = W.QCheckBox("Morgan background correction")
+        self.u_morgan.setToolTip("Same switch as Advanced, Quantify, U-Pb. Correct and check keeps it only when it clearly helps the secondary standards")
+        self.u_morgan.toggled.connect(lambda on: self.win.quant_panel.m_on.setChecked(on))
+        v5.addWidget(self.u_morgan)
+        rr = W.QHBoxLayout()
+        bu = self.b_upb = W.QPushButton("Correct and check")
+        bu.setToolTip("Takes the background off, tests Morgan against the secondary standards, makes the U-Pb layers and opens the QA/QC window")
+        bu.clicked.connect(self._upb_check)
+        bl = W.QPushButton("Make U-Pb layers")
+        bl.clicked.connect(self._make_upb)
+        bq = W.QPushButton("QA/QC")
+        bq.clicked.connect(lambda: self.win.quant_panel.open_qa())
+        bs = W.QPushButton("Best strategy...")
+        bs.setToolTip("Try primary standards, drift models, outlier limits and Morgan, and rank them by how accurately the other standards come out")
+        bs.clicked.connect(lambda: self.win.quant_panel.find_strategy())
+        bk = W.QPushButton("Settings...")
+        bk.clicked.connect(lambda: self.open_quant(1))
+        for x in (bu, bl, bq, bs, bk):
+            rr.addWidget(x)
+        rr.addStretch(1)
+        v5.addLayout(rr)
+        self.u_res = NoteLabel("")
+        self.u_res.setWordWrap(True)
+        v5.addWidget(self.u_res)
+        v.addWidget(g5)
 
         self.f_int = Fold("Advanced: interferences, every setting and table behind the corrections")
         self.f_int.add(self.win.interf_panel)
@@ -24233,6 +24276,96 @@ class CalibratePage(W.QScrollArea):
         self.q_upb.setText("<b>U-Pb</b>: " + (f"primary {', '.join(roles['primary'])}" if roles["primary"] else "no primary yet")
                            + (f", checked on {', '.join(roles['secondary'])}" if roles["secondary"] else "")
                            + f". Drift {q.u_drift.currentText()}, Morgan {'on' if q.m_on.isChecked() else 'off'}.")
+        self._fill_minerals_mirror()
+        self.u_morgan.blockSignals(True)
+        self.u_morgan.setChecked(q.m_on.isChecked())
+        self.u_morgan.blockSignals(False)
+
+    def _fill_minerals_mirror(self):
+        """The method per mineral table of the Quantify panel, here in short. Edits write straight to that table."""
+        q = self.win.quant_panel
+        t = self.t_min
+        t.blockSignals(True)
+        t.setRowCount(q.mt.rowCount())
+        for r in range(q.mt.rowCount()):
+            it = W.QTableWidgetItem(q.mt.item(r, 0).text())
+            it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            t.setItem(r, 0, it)
+            cb = W.QComboBox()
+            cb.addItems(["off", "internal", "onepoint", "sum"])
+            cb.setCurrentText(q.mt.cellWidget(r, 1).currentText())
+            cb.currentTextChanged.connect(lambda txt, r=r: self._mirror_edit(r, method=txt))
+            t.setCellWidget(r, 1, cb)
+            t.setItem(r, 2, W.QTableWidgetItem(q.mt.item(r, 2).text()))
+        t.blockSignals(False)
+        try:
+            t.itemChanged.disconnect()
+        except TypeError:
+            pass
+        t.itemChanged.connect(lambda it: self._mirror_edit(it.row(), text=it.text()) if it.column() == 2 else None)
+        t.resizeRowsToContents()
+        fit_table_height(t, 1, 6)
+
+    def _mirror_edit(self, r, method=None, text=None):
+        q = self.win.quant_panel
+        if r >= q.mt.rowCount():
+            return
+        if method is not None:
+            q.mt.cellWidget(r, 1).setCurrentText(method)
+        if text is not None:
+            q.mt.item(r, 2).setText(text)
+        self.refresh_quant_summary_only()
+
+    def refresh_quant_summary_only(self):
+        q = self.win.quant_panel
+        mins = [f"{q.mt.item(r, 0).text()} ({q.mt.cellWidget(r, 1).currentText()})" for r in range(q.mt.rowCount())
+                if q.mt.cellWidget(r, 1).currentText() != "off"]
+        rms = q.rm_list.checked()
+        self.q_trace.setText("<b>Trace elements</b>: " + (f"calibrated on {', '.join(rms)}" if rms else "no reference material ticked")
+                             + (f". Minerals: {', '.join(mins)}." if mins else ". No mineral has a method yet."))
+
+    @safe
+    def _make_ppm(self):
+        self.win.quant_panel.apply_trace()
+        self.refresh_results()
+
+    @safe
+    def _make_upb(self):
+        self.win.quant_panel.apply_upb()
+        self.refresh_results()
+
+    @safe
+    def _upb_check(self):
+        self.win.quant_panel.correct_and_check()
+        self.refresh_quant()
+        self.refresh_results()
+
+    def refresh_results(self):
+        """What the standards look like now, one line per card: the overall trace score with how many lines the calibration uses, and the U-Pb check."""
+        s, q = self.s, self.win.quant_panel
+        try:
+            q.collect_trace()                         # the score reads the session, which holds what was last applied
+        except Exception:
+            pass
+        try:
+            sc, tab = vc.trace_score(s)
+            if sc is None:
+                self.t_res.setText("")
+            else:
+                nu = nr = 0
+                for lab in [l for l in s.quant.channels if l in s.labels][:40]:
+                    try:
+                        rows, _n = vc.calib_series(s, lab, "")
+                    except Exception:
+                        continue
+                    nu += sum(r["status"] == "used" for r in rows)
+                    nr += sum(r["status"] == "rejected" for r in rows)
+                held = bool(tab.attrs.get("held_out"))
+                self.t_res.setText(f"Standards as unknowns: score {sc:.1f} % ({'held out' if held else 'in calibration'}). "
+                                   f"Lines in use across the channels: {nu}, rejected: {nr}. Check the standards for the detail.")
+        except Exception:
+            self.t_res.setText("")
+        self.u_res.setText(q.u_check_note.text() if getattr(q, "u_check_note", None) is not None else "")
 
     def open_quant(self, page):
         q = self.win.quant_panel
@@ -24267,6 +24400,7 @@ class CalibratePage(W.QScrollArea):
             ip.quiet = False
             self.b_run.setEnabled(True)
         self.refresh()
+        self.refresh_results()
         res = ip.last_workflow
         if res:
             def f(x):
