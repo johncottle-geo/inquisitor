@@ -22494,6 +22494,9 @@ class InterfPanel(W.QWidget):
         self.detail = None
         self._built = set()
         self._busy = False
+        self.verdicts = {}                    # rule id -> verdict of the last test on the standards (helps, hurts, mixed, ...)
+        self.quiet = False                    # True while the Calibrate page runs the optimiser: no pop-up, the page shows the result
+        self.last_workflow = None             # result of the last accuracy workflow
         v = W.QVBoxLayout(self)
         av = W.QVBoxLayout()                                               # everything below the line 'Advanced' lives here
         f = W.QFormLayout()
@@ -22580,8 +22583,7 @@ class InterfPanel(W.QWidget):
         self.status.setWordWrap(True)
         v.addWidget(self.status)
         self.rm_note = W.QLabel("")
-        self.rm_note.setWordWrap(True)
-        v.addWidget(self.rm_note)
+        self.rm_note.setWordWrap(True)                                       # shown on the Calibrate page (CalibratePage), not here
         self.rm_tab = W.QTableWidget(0, 6)
         self.rm_tab.setHorizontalHeaderLabels(["Reference material", "Lines", "Weak-signal bias, % (without corrections)", "206Pb/238U error, % (without)",
                                                 "204 cps (without)", "Tera-Wasserburg age error, % (without)"])
@@ -22591,7 +22593,6 @@ class InterfPanel(W.QWidget):
         self.rm_tab.setMinimumHeight(170)
         self.rm_tab.setToolTip("Your standards as they come out with the ticked corrections, and in brackets with none. Smaller is better. "
                                "Updates when you tick or untick. Uses the reference-material table of the Quantify page")
-        v.addWidget(self.rm_tab)
         self._rm_timer = QtCore.QTimer(self)
         self._rm_timer.setSingleShot(True)
         self._rm_timer.timeout.connect(lambda: self.update_rm_panel())
@@ -22968,6 +22969,9 @@ class InterfPanel(W.QWidget):
         finally:
             self._busy = False
         self.update_views()
+        page = getattr(self.win, "calib_page", None)
+        if page is not None:
+            page.refresh_corrections()
 
     def _ticked(self, it):
         if self._busy or it.column() != 0:
@@ -23118,6 +23122,10 @@ class InterfPanel(W.QWidget):
                 self.val.setItem(i, j, it)
         self.val.resizeColumnsToContents()
         self.val.setColumnWidth(0, 330)
+        self.verdicts = {r["id"]: r["verdict"] for _, r in tab.iterrows()}
+        page = getattr(self.win, "calib_page", None)
+        if page is not None:
+            page.refresh_corrections()
 
     @safe
     def report_204(self):
@@ -23320,7 +23328,7 @@ class InterfPanel(W.QWidget):
 
     def _rm_later(self):
         """The standards table takes seconds on a full session, so it waits until the ticks stop changing and only runs when the tab is shown."""
-        if getattr(self, "_wf", None) is None and hasattr(self, "_rm_timer") and self.win.tab_name() == "Interferences":
+        if getattr(self, "_wf", None) is None and hasattr(self, "_rm_timer") and self.win.tab_name() in ("Interferences", "Calibrate"):
             self._rm_timer.start(1500)
 
     def update_rm_panel(self):
@@ -23426,7 +23434,9 @@ class InterfPanel(W.QWidget):
         self.win.quant_panel.refill()
         if apply_strategy:
             self.win.quant_panel.sync_strategy(res["final"].get("strategy"), res["final"].get("strategy76"))
-        self.show_workflow(res)
+        self.last_workflow = res
+        if not self.quiet:
+            self.show_workflow(res)
         return res
 
     def show_workflow(self, res):
@@ -23506,6 +23516,428 @@ class InterfPanel(W.QWidget):
         self.rm_note.setText("")
         self.status.setText("" if self.s.source is not None else vc.NO_SOURCE)
         self.refill()
+
+
+def std_layout(sess):
+    """The standards by reference material: {rm: dict(lines, maps)}. A standard counts as a map when it sits in its own laser image
+    (the image holds nothing but lines of that material) and the image has at least four lines."""
+    lines = [i for i in sess.infos if i.use]
+    by_image = {}
+    for i in lines:
+        by_image.setdefault((i.image_name or "").strip(), []).append(i)
+    out = {}
+    for i in lines:
+        if i.role == "standard" and i.rm:
+            out.setdefault(i.rm, dict(lines=0, maps=0))["lines"] += 1
+    for rm, d in out.items():
+        for img, ls in by_image.items():
+            mine = [i for i in ls if i.role == "standard" and i.rm == rm]
+            if img and len(mine) >= 4 and len(mine) == len(ls):
+                d["maps"] += 1
+    return out
+
+
+class CalibratePage(W.QScrollArea):
+    """The front page of the Calibrate tab: the standards, the corrections, how the standards come out, and one Calibrate button.
+    Every detailed setting stays on the Interferences and Quantify pages next to it. This page reads and writes the widgets of those pages,
+    so the two always agree."""
+    FAMILIES = (("Gas blank and pedestal", ("pedestal", "gas blank")), ("Isobars", ("isobar",)), ("Oxides", ("oxide",)),
+                ("Tails", ("tail",)), ("Hydrides", ("hydride",)), ("Doubly charged ions", ("doubly charged",)), ("Line rates", ("line rates",)))
+    VERDICTS = {"helps": ("Helps", (30, 130, 60)), "hurts": ("Hurts", (190, 40, 40)), "mixed": ("Mixed", (179, 89, 0)),
+                "no clear effect": ("No clear effect", (110, 108, 100))}
+
+    def __init__(self, win):
+        super().__init__()
+        self.win = win
+        self._busy = False
+        self._expanded = False
+        self.setWidgetResizable(True)
+        self.setFrameShape(W.QFrame.Shape.NoFrame)
+        body = W.QWidget()
+        self.setWidget(body)
+        v = W.QVBoxLayout(body)
+        v.setContentsMargins(6, 6, 6, 6)
+        head = W.QHBoxLayout()
+        self.chip = W.QLabel("")
+        head.addWidget(self.chip)
+        head.addStretch(1)
+        v.addLayout(head)
+
+        g = W.QGroupBox()
+        gv = W.QVBoxLayout(g)
+        r = W.QHBoxLayout()
+        self.b_run = W.QPushButton("Calibrate")
+        self.b_run.setObjectName("primary")
+        self.b_run.setMinimumHeight(36)
+        self.b_run.setToolTip("Learns the corrections from your standards, rebuilds the map, picks the U-Pb strategy and makes the ppm and U-Pb layers")
+        self.b_run.clicked.connect(lambda: self.run())
+        r.addWidget(self.b_run)
+        self.auto = W.QCheckBox("Choose corrections automatically")
+        self.auto.setChecked(True)
+        self.auto.setToolTip("On: Calibrate first learns the corrections, tunes them and rebuilds the map, then calibrates. "
+                             "Off: Calibrate uses the corrections you ticked below as they are")
+        r.addWidget(self.auto)
+        r.addStretch(1)
+        gv.addLayout(r)
+        self.keep = W.QCheckBox("Keep my U-Pb primary and secondary choices")
+        self.keep.setToolTip("Off: the automatic choice may change which standards are primary, secondary or unused. On: your choices stay and only the Morgan coefficients are refitted")
+        gv.addWidget(self.keep)
+        gv.addWidget(NoteLabel("Ticking a correction below rebuilds the map at once. Untick the automatic box to choose them yourself."))
+        self.note = NoteLabel("")
+        gv.addWidget(self.note)
+        v.addWidget(g)
+
+        g1 = W.QGroupBox("1  Standards")
+        v1 = W.QVBoxLayout(g1)
+        self.std_note = NoteLabel("")
+        v1.addWidget(self.std_note)
+        self.std = W.QTableWidget(0, 4)
+        self.std.setHorizontalHeaderLabels(["Material", "Found", "Trace elements", "U-Pb"])
+        self.std.verticalHeader().setVisible(False)
+        self.std.horizontalHeader().setStretchLastSection(False)
+        self.std.horizontalHeader().setSectionResizeMode(1, W.QHeaderView.ResizeMode.Stretch)
+        for c in (0, 2, 3):
+            self.std.horizontalHeader().setSectionResizeMode(c, W.QHeaderView.ResizeMode.ResizeToContents)
+        self.std.setEditTriggers(W.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.std.setSelectionMode(W.QAbstractItemView.SelectionMode.NoSelection)
+        self.std.setToolTip("The same material can serve both: tick Trace elements to calibrate concentrations on it, and give it a U-Pb role. "
+                            "Trace elements needs accepted values for the material (Quantify, Reference materials)")
+        v1.addWidget(self.std)
+        v.addWidget(g1)
+
+        g2 = W.QGroupBox("2  Corrections")
+        v2 = W.QVBoxLayout(g2)
+        r = W.QHBoxLayout()
+        self.b_expand = W.QPushButton("Show individual corrections")
+        self.b_expand.setCheckable(True)
+        self.b_expand.toggled.connect(self._expand)
+        r.addWidget(self.b_expand)
+        b_test = W.QPushButton("Test each on the standards")
+        b_test.setToolTip("Adds the Helps, Hurts or Mixed verdict: every correction is judged by how well the standards agree with it in and out. It can take a few minutes")
+        b_test.clicked.connect(lambda: self.test())
+        r.addWidget(b_test)
+        r.addStretch(1)
+        v2.addLayout(r)
+        self.tree = W.QTreeWidget()
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["Correction", "Effect", "Verdict"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setMinimumHeight(190)
+        self.tree.header().setStretchLastSection(False)
+        self.tree.header().setSectionResizeMode(0, W.QHeaderView.ResizeMode.Stretch)
+        self.tree.header().setSectionResizeMode(1, W.QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(2, W.QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.itemChanged.connect(self._tree_changed)
+        v2.addWidget(self.tree)
+        self.corr_note = NoteLabel("")
+        v2.addWidget(self.corr_note)
+        v.addWidget(g2)
+        self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(lambda: self._rebuild_now())
+
+        g3 = W.QGroupBox("3  How the standards come out")
+        v3 = W.QVBoxLayout(g3)
+        v3.addWidget(NoteLabel("Each standard quantified as an unknown. In brackets: with no corrections. Smaller is better."))
+        ip = win.interf_panel
+        v3.addWidget(ip.rm_tab)
+        v3.addWidget(ip.rm_note)
+        v.addWidget(g3)
+
+        g4 = W.QGroupBox("4  Quantify")
+        v4 = W.QVBoxLayout(g4)
+        self.q_trace = W.QLabel("")
+        self.q_trace.setWordWrap(True)
+        self.q_upb = W.QLabel("")
+        self.q_upb.setWordWrap(True)
+        for lab, page in ((self.q_trace, 0), (self.q_upb, 1)):
+            rr = W.QHBoxLayout()
+            rr.addWidget(lab, 1)
+            b = W.QPushButton("Change...")
+            b.clicked.connect(lambda _=False, p=page: self.open_quant(p))
+            rr.addWidget(b)
+            v4.addLayout(rr)
+        v4.addWidget(NoteLabel("The ppm and U-Pb layers are made each time Calibrate runs."))
+        v.addWidget(g4)
+
+        rr = W.QHBoxLayout()
+        rr.addWidget(W.QLabel("Advanced:"))
+        for name in ("Interferences", "Quantify"):
+            b = W.QPushButton(name)
+            b.clicked.connect(lambda _=False, n=name: self.win.show_tab(n))
+            rr.addWidget(b)
+        rr.addStretch(1)
+        v.addLayout(rr)
+        v.addStretch(1)
+        self._set_chip("Not calibrated yet", "idle")
+
+    # ---- small helpers
+    @property
+    def s(self):
+        return self.win.s
+
+    def _set_chip(self, text, kind):
+        col = {"ok": "#1F6B3A", "busy": "#8A4B00", "idle": "#55524A", "warn": "#A12B2B"}.get(kind, "#55524A")
+        self.chip.setText("● " + text)
+        self.chip.setStyleSheet(f"color: {col}; font-weight: 600;")
+
+    def _chip_now(self):
+        ip = self.win.interf_panel
+        if self.s.map is None:
+            self._set_chip("Build the map on the Import tab first", "idle")
+        elif not self.s.interf.rules:
+            self._set_chip("Map built without corrections", "idle")
+        elif ip.on_ids() != ip._built:
+            self._set_chip("Corrections changed, rebuilding soon", "busy")
+        else:
+            n = len(ip.on_ids())
+            self._set_chip(f"Map rebuilt with {n} correction{'s' if n != 1 else ''}" if n else "Map built without corrections", "ok")
+
+    def refresh(self):
+        q = self.win.quant_panel
+        try:
+            q.refill()
+        except Exception:
+            pass
+        self.refresh_standards()
+        self.refresh_corrections()
+        self.refresh_quant()
+        self._chip_now()
+        self.win.interf_panel.update_rm_panel()
+
+    # ---- 1 standards
+    def refresh_standards(self):
+        s, q = self.s, self.win.quant_panel
+        lay = std_layout(s)
+        self._busy = True
+        try:
+            rms = sorted(lay)
+            self.std.setRowCount(len(rms))
+            trace_items = set(q.rm_list.items())
+            trace_on = set(q.rm_list.checked()) if trace_items else set(s.quant.rms or [r for r in rms if s.rm_table.get(r)])
+            roles = {q.ut.item(r, 0).text(): q.ut.cellWidget(r, 1).currentText() for r in range(q.ut.rowCount())}
+            for k, rm in enumerate(rms):
+                d = lay[rm]
+                it = W.QTableWidgetItem(rm)
+                self.std.setItem(k, 0, it)
+                found = (f"{d['maps']} map{'s' if d['maps'] != 1 else ''}, {d['lines']} lines" if d["maps"]
+                         else f"{d['lines']} line{'s' if d['lines'] != 1 else ''}")
+                self.std.setItem(k, 1, W.QTableWidgetItem(found))
+                has_vals = bool(s.rm_table.get(rm))
+                cb = W.QCheckBox()
+                cb.setChecked(has_vals and rm in trace_on)
+                cb.setEnabled(has_vals)
+                if not has_vals:
+                    cb.setToolTip(f"No accepted element values for {rm}. Add them under Quantify, Reference materials")
+                cb.toggled.connect(lambda on, n=rm: self._trace_toggled(n, on))
+                holder = W.QWidget()
+                hl = W.QHBoxLayout(holder)
+                hl.setContentsMargins(8, 0, 0, 0)
+                hl.addWidget(cb)
+                self.std.setCellWidget(k, 2, holder)
+                co = W.QComboBox()
+                co.addItems(["unused", "primary", "secondary"])
+                co.setCurrentText(roles.get(rm, "unused"))
+                co.currentTextChanged.connect(lambda t, n=rm: self._upb_changed(n, t))
+                self.std.setCellWidget(k, 3, co)
+            self.std.resizeColumnToContents(0)
+            self.std.resizeColumnToContents(1)
+            self.std.resizeColumnToContents(2)
+            fit_table_height(self.std, 2, 10)
+            maps = sum(1 for d in lay.values() if d["maps"])
+            self.std_note.setText("" if not lay else
+                                  (f"{maps} of {len(lay)} materials sit in their own image and are read as maps. " if maps else "")
+                                  + "A material can be used for trace elements and for U-Pb at the same time.")
+            if not lay:
+                self.std_note.setText("No standards yet. On the Import and group tab, set the role of the standard lines and choose their reference material.")
+        finally:
+            self._busy = False
+
+    def _trace_toggled(self, rm, on):
+        if self._busy:
+            return
+        q = self.win.quant_panel
+        lst = q.rm_list.list
+        for i in range(lst.count()):
+            if lst.item(i).text() == rm:
+                lst.item(i).setCheckState(CHECKED if on else UNCHECKED)
+        self.refresh_quant()
+
+    def _upb_changed(self, rm, role):
+        if self._busy:
+            return
+        q = self.win.quant_panel
+        for r in range(q.ut.rowCount()):
+            if q.ut.item(r, 0).text() == rm:
+                q.ut.cellWidget(r, 1).setCurrentText(role)
+        self.refresh_quant()
+
+    # ---- 2 corrections
+    def _family_of(self, rule):
+        for name, fams in self.FAMILIES:
+            if rule.family in fams:
+                return name
+        return "Other"
+
+    def _expand(self, on):
+        self._expanded = bool(on)
+        self.b_expand.setText("Hide individual corrections" if on else "Show individual corrections")
+        self.tree.setRootIsDecorated(bool(on))
+        (self.tree.expandAll if on else self.tree.collapseAll)()
+
+    def refresh_corrections(self):
+        s, ip = self.s, self.win.interf_panel
+        rules = s.interf.rules
+        self._busy = True
+        try:
+            self.tree.clear()
+            order = [n for n, _f in self.FAMILIES] + ["Other"]
+            groups = {}
+            for r in rules:
+                groups.setdefault(self._family_of(r), []).append(r)
+            for name in order:
+                rs = groups.get(name)
+                if not rs:
+                    continue
+                top = W.QTreeWidgetItem([name, "", ""])
+                top.setFlags(top.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsAutoTristate)
+                f = top.font(0)
+                f.setBold(True)
+                top.setFont(0, f)
+                self.tree.addTopLevelItem(top)
+                vs = []
+                for r in rs:
+                    ch = W.QTreeWidgetItem([r.text, r.effect, ""])
+                    ch.setFlags(ch.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    ch.setCheckState(0, CHECKED if r.enabled else UNCHECKED)
+                    ch.setData(0, Qt.ItemDataRole.UserRole, r.id)
+                    ch.setToolTip(0, r.evidence + ("\n\nFlags: " + "; ".join(r.flags) if r.flags else ""))
+                    v = ip.verdicts.get(r.id)
+                    if v:
+                        vs.append(v)
+                        self._verdict_cell(ch, v)
+                    top.addChild(ch)
+                n_on = sum(1 for r in rs if r.enabled)
+                top.setCheckState(0, CHECKED if n_on == len(rs) else UNCHECKED if n_on == 0 else Qt.CheckState.PartiallyChecked)
+                if vs:
+                    top.setText(2, "")
+                    agg = "hurts" if "hurts" in vs else "mixed" if "mixed" in vs else "helps" if "helps" in vs else "no clear effect"
+                    self._verdict_cell(top, agg)
+                else:
+                    top.setText(2, "not tested")
+                    top.setForeground(2, QtGui.QBrush(QtGui.QColor(110, 108, 100)))
+                top.setExpanded(self._expanded)
+            self.tree.setRootIsDecorated(self._expanded)
+            self.corr_note.setText("" if rules else "No corrections yet. Press Calibrate with the automatic box ticked, or use the Interferences page to analyse.")
+        finally:
+            self._busy = False
+
+    def _verdict_cell(self, item, v):
+        txt, rgb = self.VERDICTS.get(v, (v, (110, 108, 100)))
+        item.setText(2, txt)
+        item.setForeground(2, QtGui.QBrush(QtGui.QColor(*rgb)))
+
+    def _tree_changed(self, item, col):
+        if self._busy or col != 0:
+            return
+        by_id = {r.id: r for r in self.s.interf.rules}
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            for j in range(top.childCount()):
+                ch = top.child(j)
+                r = by_id.get(ch.data(0, Qt.ItemDataRole.UserRole))
+                if r is not None:
+                    r.enabled = ch.checkState(0) == CHECKED
+        self._chip_now()
+        self._timer.start(900)
+
+    def _rebuild_now(self):
+        s, ip = self.s, self.win.interf_panel
+        if not s.interf.rules or ip.on_ids() == ip._built:
+            self._chip_now()
+            return
+        if s.map is None:
+            self._chip_now()
+            return
+        self._set_chip("Rebuilding the map...", "busy")
+        W.QApplication.processEvents()
+        ip.refill()
+        ip.rebuild()
+        ip.update_rm_panel()
+        self.refresh()
+
+    @safe
+    def test(self):
+        ip = self.win.interf_panel
+        if ip.detail is None:
+            raise ValueError("Press Calibrate first, or analyse on the Interferences page, so there is something to test")
+        self._set_chip("Testing the corrections on the standards...", "busy")
+        W.QApplication.processEvents()
+        W.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            ip.validate()
+        finally:
+            W.QApplication.restoreOverrideCursor()
+        self._chip_now()
+
+    # ---- 4 quantify summary
+    def refresh_quant(self):
+        q = self.win.quant_panel
+        rms = q.rm_list.checked()
+        mins = [f"{q.mt.item(r, 0).text()} ({q.mt.cellWidget(r, 1).currentText()})" for r in range(q.mt.rowCount())
+                if q.mt.cellWidget(r, 1).currentText() != "off"]
+        self.q_trace.setText("<b>Trace elements</b>: " + (f"calibrated on {', '.join(rms)}" if rms else "no reference material ticked")
+                             + (f". Minerals: {', '.join(mins)}." if mins else ". No mineral has a method yet."))
+        roles = {"primary": [], "secondary": []}
+        for r in range(q.ut.rowCount()):
+            role = q.ut.cellWidget(r, 1).currentText()
+            if role in roles:
+                roles[role].append(q.ut.item(r, 0).text())
+        self.q_upb.setText("<b>U-Pb</b>: " + (f"primary {', '.join(roles['primary'])}" if roles["primary"] else "no primary yet")
+                           + (f", checked on {', '.join(roles['secondary'])}" if roles["secondary"] else "")
+                           + f". Drift {q.u_drift.currentText()}, Morgan {'on' if q.m_on.isChecked() else 'off'}.")
+
+    def open_quant(self, page):
+        q = self.win.quant_panel
+        q.which.setCurrentIndex(page)
+        self.win.show_tab("Quantify")
+
+    # ---- the one button
+    @safe
+    def run(self):
+        win, s = self.win, self.s
+        q, ip = win.quant_panel, win.interf_panel
+        if s.source is None:
+            raise ValueError(vc.NO_SOURCE)
+        if s.map is None:
+            raise ValueError("Build the map once on the Import tab (pick the channels first), set the standards, then come back")
+        q.all_opt.setChecked(self.auto.isChecked())
+        q.all_keep.setChecked(self.keep.isChecked())
+        self._set_chip("Calibrating...", "busy")
+        self.b_run.setEnabled(False)
+        W.QApplication.processEvents()
+        ip.quiet = True
+        ip.last_workflow = None
+        try:
+            q.apply_all()
+            if self.auto.isChecked() and ip.detail is not None and len({str(x) for x in np.asarray(ip.detail["raw"].rm_of)}) >= 2:
+                try:
+                    type(ip).validate.__wrapped__(ip)                # the verdicts; a failure here is not a failure of the calibration
+                except Exception:
+                    pass
+        finally:
+            ip.quiet = False
+            self.b_run.setEnabled(True)
+        self.refresh()
+        res = ip.last_workflow
+        if res:
+            def f(x):
+                return "-" if x is None or not np.isfinite(x) else f"{x:.2f}"
+            fin = res["final"]
+            self.note.setText(f"Kept: {res['winner']}. U-Pb strategy score {f(res['base']['upb'])} % before, {f(fin['upb'])} % after. "
+                              f"Trace element recovery score {f(res['base']['trace'])} % before, {f(fin['trace'])} % after.")
+        else:
+            self.note.setText(q.all_note.text())
 
 
 class MainWindow(W.QMainWindow):
@@ -24167,17 +24599,10 @@ class MainWindow(W.QMainWindow):
         self.interf_panel.lo.valueChanged.connect(lambda _v: self.interf_panel.lo_changed())
         self.quant_panel = QuantPanel(self)
         q, ip = self.quant_panel, self.interf_panel
+        self.calib_page = CalibratePage(self)
         box = W.QWidget()
         v = W.QVBoxLayout(box)
         v.setContentsMargins(4, 4, 4, 4)
-        r = W.QHBoxLayout()
-        r.addWidget(q.b_opt, 1)
-        r.addWidget(q.b_all, 1)
-        v.addLayout(r)
-        fo = self.apply_opts = Fold("Options for Apply everything")
-        fo.add(q.all_opt)
-        fo.add(q.all_keep)
-        v.addWidget(fo)
         v.addWidget(q.all_note)
         v.addWidget(ip.stale)
         self.cal_tabs = W.QTabWidget()
@@ -24185,8 +24610,12 @@ class MainWindow(W.QMainWindow):
         sa.setWidgetResizable(True)
         sa.setFrameShape(W.QFrame.Shape.NoFrame)
         sa.setWidget(ip)
+        self.cal_tabs.addTab(self.calib_page, "Calibrate")
         self.cal_tabs.addTab(sa, "Interferences")
         self.cal_tabs.addTab(q, "Quantify")
+        self.cal_tabs.setTabToolTip(0, "Standards, corrections and the result in one place. One button does the whole calibration")
+        self.cal_tabs.setTabToolTip(1, "Advanced: every setting and table behind the corrections")
+        self.cal_tabs.setTabToolTip(2, "Advanced: trace element, U-Pb, ratio and reference value settings")
         self.cal_tabs.currentChanged.connect(self.on_tab_changed)
         v.addWidget(self.cal_tabs, 1)
         return box
@@ -24209,6 +24638,8 @@ class MainWindow(W.QMainWindow):
                 and not sp.startswith("mineral:") and self.disp_mode.currentIndex() == 0):
             self.min_layer.setCurrentText(sp)
             self.sync_find_layers()
+        if self.tab_name() == "Calibrate" and getattr(self, "calib_page", None) is not None:
+            self.calib_page.refresh()
         if self.tab_name() == "Quantify":
             self.quant_panel.refill()
             sizes = self.split.sizes()
