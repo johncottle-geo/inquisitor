@@ -428,6 +428,22 @@ RAW_SHOT_OFFSETS = (-1, 0, 1, 2, 3, 4, 5, 6, 7)
 RAW_SHOT_KERNEL = (0.038, 1.388, 0.650, 0.717, 0.737, 0.690, 0.509, 0.047, 0.011)
 
 
+def raw_shot_weights(block_acq):
+    """(block offsets, weights) of RAW_SHOT_KERNEL for integ files whose blocks are `block_acq` acquisitions long. The kernel was fitted on files with
+    8-acquisition blocks, so each of its bins covers 8 acquisitions starting at 8 * offset. Runs with other block lengths (4 at 500 Hz, for example)
+    get the same shape re-binned to their blocks, and the same total weight. For 8-acquisition blocks this returns RAW_SHOT_KERNEL unchanged."""
+    B = max(int(round(block_acq)), 1)
+    ks = np.arange(-int(np.ceil(8.0 / B)), 40)
+    w = np.zeros(len(ks))
+    for m, wm in zip(RAW_SHOT_OFFSETS, RAW_SHOT_KERNEL):
+        a0, a1 = 8 * m, 8 * m + 8
+        for i, k in enumerate(ks):
+            ov = max(0, min(a1, B * (k + 1)) - max(a0, B * k))
+            w[i] += wm / 8.0 * ov
+    keep = w > 0
+    return ks[keep], w[keep]
+
+
 def _natural_member_key(s):
     return _natural_key(s)
 
@@ -744,16 +760,18 @@ class RawVitesseSource:
             return np.zeros((0, 3 + nl)), run["labels"]
         j = np.searchsorted(acq, E, side="left")
         nb = np.diff(j)
-        acq_ext = np.append(acq, acq[-1] + 8)
+        acq_ext = np.append(acq, acq[-1] + (int(np.median(np.diff(acq))) if len(acq) > 1 else 8))
         t_ms = acq_ext[np.minimum(j[1:], len(acq))] * run["period_ns"] * 1e-6
         # the counts of a cycle: for each of its shots, the blocks from the one that starts at or after the shot (plus transit time) onward,
         # weighted with the weights measured against NuQuant (RAW_SHOT_KERNEL)
-        dt_blk = (float(np.median(np.diff(P))) if ns > 1 else 39.0) / 8.0                      # the length of a shot in blocks
-        kern = np.array(RAW_SHOT_KERNEL) * (dt_blk / sum(RAW_SHOT_KERNEL))                     # the weights add up to the length of a shot
+        blk_acq = float(np.median(np.diff(acq))) if len(acq) > 1 else 8.0                      # acquisitions per block (8 at 1 kHz, 4 in some 500 Hz runs)
+        dt_blk = (float(np.median(np.diff(P))) if ns > 1 else 39.0) / blk_acq                  # the length of a shot in blocks
+        offs, kern = raw_shot_weights(blk_acq)
+        kern = kern * (dt_blk / kern.sum())                                                    # the weights add up to the length of a shot
         c0 = np.searchsorted(acq, P + T, side="left")
         shot = np.zeros((ns, Y.shape[1]))
-        for m, w in zip(RAW_SHOT_OFFSETS, kern):
-            idx = np.clip(c0 + m, 0, len(acq) - 1)
+        for m, w in zip(offs, kern):
+            idx = np.clip(c0 + int(m), 0, len(acq) - 1)
             shot += w * Y[idx]
         first = np.arange(nrows) * spc
         counts = np.add.reduceat(shot[:nrows * spc if nrows * spc <= ns else ns], first, axis=0)
@@ -761,7 +779,7 @@ class RawVitesseSource:
         # NuQuant divides by the nominal length of the cycle (its shots times the shot spacing), not by the 24 or 25 whole blocks
         # between the time labels. Dividing by the labels leaves a 2 percent saw-tooth on high-count signals, this does not.
         nsh = np.minimum(spc, ns - first)
-        dur_s = np.where(nb > 0, nsh * (dt_blk * 8.0) * run["period_ns"] * 1e-9, np.nan)
+        dur_s = np.where(nb > 0, nsh * (dt_blk * blk_acq) * run["period_ns"] * 1e-9, np.nan)
         cps = counts / run["sia"] / dur_s[:, None]
         cps[~np.isfinite(cps)] = 0.0
         if self.subtract_blank:
