@@ -23252,7 +23252,8 @@ class InterfPanel(W.QWidget):
 
     def apply_layout(self):
         win = self.win
-        on = win.tab_name() == "Interferences"
+        cp = getattr(win, "calib_page", None)
+        on = win.tab_name() == "Calibrate" and cp is not None and cp.f_int.head.isChecked()
         if on:
             self._rm_later()
             if win.plot_host.indexOf(self.plot_box) < 0:
@@ -23996,14 +23997,14 @@ class CalibratePage(W.QScrollArea):
         v4.addWidget(NoteLabel("The ppm and U-Pb layers are made each time Calibrate runs."))
         v.addWidget(g4)
 
-        rr = W.QHBoxLayout()
-        rr.addWidget(W.QLabel("Advanced:"))
-        for name in ("Interferences", "Quantify"):
-            b = W.QPushButton(name)
-            b.clicked.connect(lambda _=False, n=name: self.win.show_tab(n))
-            rr.addWidget(b)
-        rr.addStretch(1)
-        v.addLayout(rr)
+        self.f_int = Fold("Advanced: interferences, every setting and table behind the corrections")
+        self.f_int.add(self.win.interf_panel)
+        self.f_q = Fold("Advanced: quantify, trace element, U-Pb, ratio and reference value settings")
+        self.f_q.add(self.win.quant_panel)
+        v.addWidget(self.f_int)
+        v.addWidget(self.f_q)
+        self.f_int.head.toggled.connect(lambda _on: self.win.on_tab_changed())
+        self.f_q.head.toggled.connect(lambda _on: self.win.on_tab_changed())
         v.addStretch(1)
         self._set_chip("Not calibrated yet", "idle")
 
@@ -24237,6 +24238,7 @@ class CalibratePage(W.QScrollArea):
         q = self.win.quant_panel
         q.which.setCurrentIndex(page)
         self.win.show_tab("Quantify")
+        self.ensureWidgetVisible(self.f_q)
 
     # ---- the one button
     @safe
@@ -24929,8 +24931,7 @@ class MainWindow(W.QMainWindow):
         return self.stats
 
     def _calibrate_tab(self):
-        """One tab for the whole calibration: a shared header (Optimise, Apply everything, the out-of-date warning) over two pages,
-        Interferences (what to take off the counts) and Quantify (ppm and U-Pb ages)."""
+        """One tab for the whole calibration: the Calibrate page, with the Interferences and Quantify settings folded into its Advanced sections."""
         self.interf_panel = InterfPanel(self)
         self.interf_panel.lo.valueChanged.connect(lambda _v: self.interf_panel.lo_changed())
         self.quant_panel = QuantPanel(self)
@@ -24941,28 +24942,16 @@ class MainWindow(W.QMainWindow):
         v.setContentsMargins(4, 4, 4, 4)
         v.addWidget(q.all_note)
         v.addWidget(ip.stale)
-        self.cal_tabs = W.QTabWidget()
-        sa = W.QScrollArea()
-        sa.setWidgetResizable(True)
-        sa.setFrameShape(W.QFrame.Shape.NoFrame)
-        sa.setWidget(ip)
-        self.cal_tabs.addTab(self.calib_page, "Calibrate")
-        self.cal_tabs.addTab(sa, "Interferences")
-        self.cal_tabs.addTab(q, "Quantify")
-        self.cal_tabs.setTabToolTip(0, "Standards, corrections and the result in one place. One button does the whole calibration")
-        self.cal_tabs.setTabToolTip(1, "Advanced: every setting and table behind the corrections")
-        self.cal_tabs.setTabToolTip(2, "Advanced: trace element, U-Pb, ratio and reference value settings")
-        self.cal_tabs.currentChanged.connect(self.on_tab_changed)
-        v.addWidget(self.cal_tabs, 1)
+        v.addWidget(self.calib_page, 1)
         return box
 
     def show_tab(self, name):
-        """Show a tab by name. 'Interferences' and 'Quantify' are the two pages of the Calibrate tab."""
+        """Show a tab by name. 'Interferences' and 'Quantify' are the Advanced sections of the Calibrate tab: they open there."""
         if name in ("Interferences", "Quantify"):
             self.show_tab("Calibrate")
-            for i in range(self.cal_tabs.count()):
-                if self.cal_tabs.tabText(i) == name:
-                    self.cal_tabs.setCurrentIndex(i)
+            f = self.calib_page.f_int if name == "Interferences" else self.calib_page.f_q
+            if not f.head.isChecked():
+                f.head.setChecked(True)
             return
         for i in range(self.tabs.count()):
             if self.tabs.tabText(i) == name:
@@ -24976,7 +24965,7 @@ class MainWindow(W.QMainWindow):
             self.sync_find_layers()
         if self.tab_name() == "Calibrate" and getattr(self, "calib_page", None) is not None:
             self.calib_page.refresh()
-        if self.tab_name() == "Quantify":
+        if self.tab_name() == "Calibrate" and self.calib_page.f_q.head.isChecked():
             self.quant_panel.refill()
             sizes = self.split.sizes()
             if len(sizes) == 2 and sizes[1] < 600 and sum(sizes) > 900:
@@ -26038,9 +26027,7 @@ class MainWindow(W.QMainWindow):
         tabs = getattr(self, "tabs", None)
         if tabs is None or tabs.count() == 0:
             return ""
-        n = tabs.tabText(tabs.currentIndex())
-        ct = getattr(self, "cal_tabs", None)
-        return ct.tabText(ct.currentIndex()) if n == "Calibrate" and ct is not None else n
+        return tabs.tabText(tabs.currentIndex())
 
     def refresh_working_base(self):
         s = self.s
